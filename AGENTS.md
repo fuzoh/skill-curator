@@ -15,3 +15,20 @@ from candidate approaches and unresolved decisions.
   or supporting script requires an explicit trust decision.
 - Record new design decisions in the relevant planning document. Keep proposals
   labeled as proposals until agreed.
+
+## Agent skills
+
+### Issue tracker
+
+Track issues and specs in GitHub Issues for `fuzoh/skill-curator`.
+Read `docs/agents/issue-tracker.md` before issue operations.
+
+### Triage labels
+
+Use the five canonical triage labels.
+Read `docs/agents/triage-labels.md` before triaging or applying triage labels.
+
+### Domain docs
+
+Single-context: root `GLOSSARY.md` and `docs/adr/`.
+Read `docs/agents/domain.md` before exploring domain terminology or decisions.
