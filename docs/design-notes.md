@@ -106,3 +106,23 @@ sent to an external provider.
 Agree on one concrete user journey and its acceptance criteria. Test that journey
 with a small sample before committing to a general configuration schema or
 extensibility framework.
+
+## Planning map
+
+Decisions are now tracked on the wayfinder map,
+[Map: skill-curator v1 spec and personal Collection](https://github.com/fuzoh/skill-curator/issues/1),
+and its child tickets. Resolved terms live in [GLOSSARY.md](../GLOSSARY.md).
+
+Settled while charting the map (2026-11-05):
+
+- The first user is the project owner, on an interactive workstation and a
+  headless server, with Claude Code and pi as the two target harnesses.
+- This repository holds only the tool. The user's Collection (Manifest, lock,
+  Adaptation intents) is a separate user-owned repository; whether the tool
+  ships an example starter is undecided.
+- Copy, Adapt, and Composition are all in the first version.
+- The tool never calls a model API itself. It prepares the context and hands
+  the rewrite to the user's agent, then validates and records the accepted
+  result.
+- Out of scope for the first version: sandbox capability declarations,
+  per-environment variants, other harnesses, hosted registry, bundling.
