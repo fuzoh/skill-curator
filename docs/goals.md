@@ -52,7 +52,13 @@ independently of the tool.
 ### Profiles and installation
 
 - Configure destination paths instead of assuming a particular machine layout.
-- Select variants based on the target environment and available tools.
+- Reproduce the same curated skill set across multiple machines (such as a
+  workstation and a headless server) from a shared manifest.
+- Support self-contained, materialized installations so sandboxed agents can
+  mount the destination read-only without exposing external host paths or
+  following outside symlinks.
+- Select variants based on the target environment, execution mode (interactive
+  or headless/autonomous), and available tools.
 - Support manually invoked skills, discoverable skills, and composed workflows
   where the target environment supports them.
 - Report unsupported capabilities rather than silently changing their meaning.

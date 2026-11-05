@@ -47,12 +47,31 @@ A separate lock or history mechanism may be useful for resolved revisions and
 accepted artifacts. Its relationship with the user's version control is undecided.
 Secrets and machine-specific credentials should stay outside shared manifests.
 
-## Environment compatibility
+## Environment and sandbox compatibility
 
 Profiles or adapters could express differences between agent environments:
 metadata support, tool names, file layout, manual invocation, and delegation.
 Prefer explicit capability checks to assuming that rewriting a tool name makes a
 skill compatible.
+
+When skills are used by autonomous or orchestrated agents running inside
+sandboxes (for example namespace sandboxes or container runtimes):
+
+- **Self-contained installation:** Installing skills as materialized files
+  rather than symlinks to external repositories allows a sandbox launcher to
+  bind-mount the destination directory read-only without exposing the rest of
+  the host filesystem.
+- **Runtime capability declarations:** Skills that invoke bundled scripts,
+  require specific host binaries, or need network egress could declare those
+  requirements in the manifest or profile metadata so a sandbox or orchestrator
+  can validate compatibility or filter skills by profile (such as interactive
+  versus headless execution).
+- **Multi-machine parity:** Separating portable manifests and lock state from
+  machine-local destination paths allows keeping an interactive workstation and
+  an autonomous server synchronized on the same curated skill revisions.
+- **Multi-harness workflows:** Orchestrated pipelines that mix several agent
+  harnesses across steps benefit from both shared harness-neutral skill trees
+  and harness-specific adaptations generated from the same source definitions.
 
 Composition is another possibility: an entry-point skill can reference smaller
 skills or principles instead of combining everything into a single prompt. The
