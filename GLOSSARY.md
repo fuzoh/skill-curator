@@ -33,9 +33,11 @@ Source and Revision, with which Adaptation, to which Destination.
 _Avoid_: Config, lock file, registry
 
 **Collection**:
-The user-owned, portable repository holding the Manifest, resolved Revisions,
-and written Adaptation intents. Lives outside the tool's source tree.
-_Avoid_: Dotfiles, config repo, profile
+The user-owned, portable directory holding the Manifest, resolved Revisions,
+written Adaptation intents, and curated Skills. Lives outside the tool's source
+tree (for example as a subdirectory of the user's dotfiles repository or as its
+own repository).
+_Avoid_: Config repo, profile
 
 **Composition**:
 A Skill produced from several source Skills and a written intent; the third
