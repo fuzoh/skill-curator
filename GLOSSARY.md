@@ -43,3 +43,9 @@ _Avoid_: Config repo, profile
 A Skill produced from several source Skills and a written intent; the third
 mode alongside copying a Skill unchanged and adapting one.
 _Avoid_: Merge, bundle, meta-skill
+
+**Fragment**:
+A reusable Markdown section of global agent instructions maintained in the
+Collection and assembled per target harness into files such as `CLAUDE.md` or
+`AGENTS.md`.
+_Avoid_: Snippet, template, partial

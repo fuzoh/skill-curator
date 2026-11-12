@@ -118,11 +118,13 @@ Settled while charting the map (2026-11-05):
 - The first user is the project owner, on an interactive workstation and a
   headless server, with Claude Code and pi as the two target harnesses.
 - This repository holds only the tool. The user's Collection (Manifest, lock,
-  Adaptation intents) is a separate user-owned repository; whether the tool
-  ships an example starter is undecided.
-- Copy, Adapt, and Composition are all in the first version.
-- The tool never calls a model API itself. It prepares the context and hands
-  the rewrite to the user's agent, then validates and records the accepted
-  result.
+  Adaptation/Composition intents, global instruction Fragments, and materialised
+  Skill tree) lives in a subdirectory of `~/dotdot`; whether the tool ships an
+  example starter is undecided.
+- Copy, Adapt, Composition, and global instruction Fragments (assembled per
+  target harness into `CLAUDE.md` / `AGENTS.md`) are all in the first version.
+- The tool never calls a model API itself. Its CLI prepares the context and
+  spawns the user's agent (`pi` pre-prompted, or Claude Code) for rewrites,
+  then validates and records the accepted result.
 - Out of scope for the first version: sandbox capability declarations,
   per-environment variants, other harnesses, hosted registry, bundling.
