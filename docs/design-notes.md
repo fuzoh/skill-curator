@@ -213,9 +213,12 @@ Choices made there:
   remote `HEAD` when none is set, fetched without tags into one tracking
   reference, so changing `branch` (even from `release` to `release/v2`)
   never collides with an older tracking reference. Extracting a Revision
-  that is not cached fetches it by identifier; when the Source answers that
-  it does not have it, the typed `RevisionUnreachable` error lets callers
-  fall back to a two-way comparison. A Source that cannot be reached
+  that is not cached fetches it by identifier. When the Source refuses (as
+  every protocol v0 or v1 server does for a commit that is not a branch
+  tip), every branch is fetched, with pruning, into private mirror
+  references; if no branch brings the Revision, the typed
+  `RevisionUnreachable` error lets callers fall back to a two-way
+  comparison. A Source that cannot be reached
   (network, authentication) stays a plain `git fetch` failure, recognised
   from Git's untranslated (`LC_ALL=C`) diagnostics, so a transient outage is
   never mistaken for a history rewrite. Each extracted Revision is kept by a

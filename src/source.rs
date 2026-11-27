@@ -43,14 +43,20 @@ const SOURCES_DIR: &str = "sources";
 const URL_HASH_LEN: usize = 16;
 /// Reference holding the tip last fetched from the Source's branch.
 const CANDIDATE_REF: &str = "refs/skill-curator/candidate";
-/// What `git fetch` reports when the remote was reached but does not have
+/// References mirroring every branch of the Source, fetched when the Source
+/// refuses to serve a Revision by identifier.
+const BRANCHES_REFSPEC: &str = "+refs/heads/*:refs/skill-curator/heads/*";
+/// What `git fetch` reports when the remote was reached but does not serve
 /// the object or reference asked for, as opposed to a transport or
-/// authentication failure. `git` runs with `LC_ALL=C`, so these are not
-/// translated.
+/// authentication failure. Protocol v2 servers answer "not our ref"; over
+/// protocol v0 or v1 the client itself refuses an object the server did not
+/// advertise, even one its branches still reach. `git` runs with
+/// `LC_ALL=C`, so these are not translated.
 const REMOTE_LACKS_OBJECT: &[&str] = &[
     "not our ref",
     "no such remote ref",
     "couldn't find remote ref",
+    "does not allow request for unadvertised object",
 ];
 
 /// Failure to fetch a Source or extract a Skill from it.
@@ -315,6 +321,7 @@ impl SourceCache {
             &repository,
             &source.url,
             &format!("+{wanted}:{CANDIDATE_REF}"),
+            false,
         )?;
         let output = self.git.run(
             Some(&repository),
@@ -337,9 +344,10 @@ impl SourceCache {
     /// license files.
     ///
     /// The Revision is read from the cache; when missing, it is fetched by
-    /// identifier. Only regular files are extracted: symbolic links,
-    /// submodules, and paths with `..`, `.`, or `.git` components are
-    /// refused, all of them listed in the error.
+    /// identifier, or with every branch of the Source when the Source does
+    /// not serve commits by identifier. Only regular files are extracted:
+    /// symbolic links, submodules, and paths with `..`, `.`, or `.git`
+    /// components are refused, all of them listed in the error.
     ///
     /// # Errors
     ///
@@ -488,8 +496,16 @@ impl SourceCache {
     }
 
     /// Fetches `refspec` from `url` into the cache, without tags or
-    /// submodules.
-    fn fetch_from(&self, repository: &Path, url: &str, refspec: &str) -> Result<(), SourceError> {
+    /// submodules, removing local references the refspec maps to when
+    /// `prune` is set and the Source no longer has them.
+    fn fetch_from(
+        &self,
+        repository: &Path,
+        url: &str,
+        refspec: &str,
+        prune: bool,
+    ) -> Result<(), SourceError> {
+        let prune = if prune { "--prune" } else { "--no-prune" };
         self.git
             .run(
                 Some(repository),
@@ -499,6 +515,7 @@ impl SourceCache {
                     OsStr::new("--no-tags"),
                     OsStr::new("--no-recurse-submodules"),
                     OsStr::new("--no-write-fetch-head"),
+                    OsStr::new(prune),
                     OsStr::new("--end-of-options"),
                     OsStr::new(url),
                     OsStr::new(refspec),
@@ -507,8 +524,13 @@ impl SourceCache {
             .map(drop)
     }
 
-    /// Makes sure `revision` is a commit of the cache, fetching it by
-    /// identifier when missing, and keeps it there with a reference.
+    /// Makes sure `revision` is a commit of the cache, fetching it when
+    /// missing, and keeps it there with a reference.
+    ///
+    /// A missing Revision is fetched by identifier. When the Source answers
+    /// that it does not serve it, which a protocol v0 or v1 server does for
+    /// any commit that is not a branch tip, every branch is fetched instead;
+    /// the Revision is unreachable only if no branch brings it.
     fn ensure_revision(
         &self,
         repository: &Path,
@@ -517,28 +539,32 @@ impl SourceCache {
         revision: &Revision,
     ) -> Result<(), SourceError> {
         if !self.has_commit(repository, revision)? {
-            let unreachable = |detail: String| SourceError::RevisionUnreachable {
-                source_name: name.clone(),
-                url: source.url.clone(),
-                revision: revision.clone(),
-                detail,
-            };
-            match self.fetch_from(repository, &source.url, revision.as_str()) {
-                Ok(()) => {}
-                // Only a remote that answered without the object means the
-                // Revision is gone. A transport or authentication failure
-                // stays a fetch error, since the Revision may still exist.
+            let refused = match self.fetch_from(repository, &source.url, revision.as_str(), false) {
+                Ok(()) => String::new(),
+                // Only a remote that answered without serving the object
+                // can mean the Revision is gone. A transport or
+                // authentication failure stays a fetch error, since the
+                // Revision may still exist.
                 Err(SourceError::Git { stderr, .. })
                     if REMOTE_LACKS_OBJECT
                         .iter()
                         .any(|diagnostic| stderr.contains(diagnostic)) =>
                 {
-                    return Err(unreachable(stderr));
+                    // Pruning lets a branch replace a deleted one whose
+                    // name it extends, such as `release/v2` after
+                    // `release`.
+                    self.fetch_from(repository, &source.url, BRANCHES_REFSPEC, true)?;
+                    stderr
                 }
                 Err(err) => return Err(err),
-            }
+            };
             if !self.has_commit(repository, revision)? {
-                return Err(unreachable(String::new()));
+                return Err(SourceError::RevisionUnreachable {
+                    source_name: name.clone(),
+                    url: source.url.clone(),
+                    revision: revision.clone(),
+                    detail: refused,
+                });
             }
         }
         // Pin the Revision so it outlives upstream rewrites of the branch it

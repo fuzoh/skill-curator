@@ -30,13 +30,28 @@ const APACHE: &str = "                                 Apache License\n         
 /// repositories, and a Source cache.
 struct Sandbox {
     dir: TempDir,
+    /// Global Git configuration file, `/dev/null` unless set by the test.
+    git_config: PathBuf,
 }
 
 impl Sandbox {
     fn new() -> Result<Self, Box<dyn Error>> {
         let dir = TempDir::new()?;
         fs::create_dir(dir.path().join("home"))?;
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            git_config: PathBuf::from("/dev/null"),
+        })
+    }
+
+    /// A sandbox whose global Git configuration, read by the cache and the
+    /// upstream alike, is `contents`, as a user's own settings would be.
+    fn with_git_config(contents: &str) -> Result<Self, Box<dyn Error>> {
+        let mut sandbox = Self::new()?;
+        let config = sandbox.dir.path().join("gitconfig");
+        fs::write(&config, contents)?;
+        sandbox.git_config = config;
+        Ok(sandbox)
     }
 
     fn home(&self) -> PathBuf {
@@ -47,7 +62,7 @@ impl Sandbox {
     fn env(&self) -> Vec<(&'static str, PathBuf)> {
         vec![
             ("HOME", self.home()),
-            ("GIT_CONFIG_GLOBAL", PathBuf::from("/dev/null")),
+            ("GIT_CONFIG_GLOBAL", self.git_config.clone()),
             ("GIT_CONFIG_NOSYSTEM", PathBuf::from("1")),
         ]
     }
@@ -442,6 +457,66 @@ fn an_unreachable_old_revision_is_reported_distinctly() -> TestResult {
     // The new Revision still extracts, so callers can fall back to it.
     let current = cache.extract(&source_name, &source, &first, &path("skills/a")?)?;
     assert_eq!(read(&current, SKILL_FILE)?, "1\n");
+    Ok(())
+}
+
+/// Over protocol v0 or v1, which servers without protocol v2 support and
+/// users with `protocol.version=0` get, Git refuses to fetch any commit that
+/// is not a branch tip by identifier. Revisions the branches still reach
+/// must extract anyway, and rewritten ones must stay `RevisionUnreachable`.
+#[test]
+fn protocol_v0_fetches_revisions_through_branches() -> TestResult {
+    let sandbox = Sandbox::with_git_config("[protocol]\n\tversion = 0\n")?;
+    let upstream = sandbox.upstream("upstream")?;
+    upstream.write("skills/a/SKILL.md", "1\n")?;
+    let first = upstream.commit("first")?;
+    upstream.write("skills/a/SKILL.md", "rewritten\n")?;
+    let rewritten = upstream.commit("rewritten")?;
+    upstream.rewrite_to(&first)?;
+    assert!(!upstream.has_commit(&rewritten));
+    upstream.git(&["branch", "--quiet", "release"])?;
+
+    let cache = sandbox.cache();
+    let source_name = name("s")?;
+    let source = upstream.source();
+    assert_eq!(cache.fetch(&source_name, &source)?, first);
+
+    // Another machine moved the lock to a commit that is no longer the tip.
+    upstream.write("skills/a/SKILL.md", "behind\n")?;
+    let behind = upstream.commit("behind")?;
+    upstream.write("skills/a/SKILL.md", "tip\n")?;
+    upstream.commit("tip")?;
+    let skill = cache.extract(&source_name, &source, &behind, &path("skills/a")?)?;
+    assert_eq!(read(&skill, SKILL_FILE)?, "behind\n");
+
+    // A branch replaced by one whose name extends it does not block the
+    // branches from being fetched again.
+    upstream.git(&["update-ref", "-d", "refs/heads/release"])?;
+    upstream.git(&["switch", "--quiet", "--create", "release/v2"])?;
+    upstream.write("skills/a/SKILL.md", "release\n")?;
+    let release = upstream.commit("release")?;
+    upstream.git(&["switch", "--quiet", "main"])?;
+    upstream.write("skills/a/SKILL.md", "after release\n")?;
+    upstream.commit("after release")?;
+    let skill = cache.extract(&source_name, &source, &release, &path("skills/a")?)?;
+    assert_eq!(read(&skill, SKILL_FILE)?, "release\n");
+
+    let never_existed = Revision::new(&"0".repeat(40))?;
+    for missing in [&rewritten, &never_existed] {
+        let err = cache
+            .extract(&source_name, &source, missing, &path("skills/a")?)
+            .err()
+            .ok_or("an unreachable Revision must fail")?;
+        let SourceError::RevisionUnreachable {
+            revision, detail, ..
+        } = &err
+        else {
+            return Err(format!("expected RevisionUnreachable, got {err:?}").into());
+        };
+        assert_eq!(revision, missing);
+        // The cache really spoke protocol v0.
+        assert!(detail.contains("unadvertised object"), "{detail}");
+    }
     Ok(())
 }
 
