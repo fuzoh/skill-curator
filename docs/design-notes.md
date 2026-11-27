@@ -235,9 +235,15 @@ Choices made there:
   `UNLICENSE` (any case, optionally followed by `.`, `-`, or `_` and more
   text) at the Source root, in each directory leading to the Skill (such as
   `pstack/LICENSE` for `pstack/critique`), and in the Skill directory. The
-  summary is the file's `SPDX-License-Identifier` tag, else the first match
-  among characteristic phrases of common licenses, else absent. The warning
-  fires when no file is found or any found file is unidentified.
+  summary is the file's `SPDX-License-Identifier` tag, else the GNU license
+  named first near the top of the text with the version right after it
+  (full GNU texts and the MPL-2.0 name other GNU licenses further down),
+  else the first match among characteristic phrases of other common
+  licenses, with exclusions so that a text is never read as a laxer
+  relative (MIT as MIT-0, BSD-3-Clause as BSD-2-Clause), else absent. A
+  near miss stays unidentified rather than getting a wrong summary.
+  Regression tests run on full canonical texts. The warning fires when no
+  file is found or any found file is unidentified.
 - `ATTRIBUTION.md` is rendered from `lock.toml` alone: Skills by name,
   provenance entries by Composition input, Source, and path, every value in
   a code span that no lock value can break out of. It lists, per upstream

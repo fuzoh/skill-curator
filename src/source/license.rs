@@ -6,60 +6,113 @@ use std::fmt;
 use crate::collection::lock::LicenseFile;
 use crate::safety::{Name, RelativePath};
 
-/// Characteristic phrases of common licenses, checked in order against the
-/// text lowercased with whitespace collapsed. Every phrase of an entry must
-/// appear and none of its exclusions. More specific licenses come first:
-/// the LGPL text mentions the GPL, and MIT-0 is MIT without its condition.
+/// GNU licenses by the name in their title, each with its versions. The
+/// full texts name one another further down (the GPL-3.0 mentions the AGPL
+/// and the LGPL, the MPL-2.0 all of them), so only the name that comes first
+/// near the top of the text counts, with the version right after it. Neither
+/// `gnu general public license` nor any other name here contains another.
+const GNU_LICENSES: &[(&str, &[(&str, &str)])] = &[
+    (
+        "gnu affero general public license",
+        &[("version 3", "AGPL-3.0")],
+    ),
+    (
+        "gnu lesser general public license",
+        &[("version 3", "LGPL-3.0"), ("version 2.1", "LGPL-2.1")],
+    ),
+    (
+        "gnu library general public license",
+        &[("version 2", "LGPL-2.0")],
+    ),
+    (
+        "gnu general public license",
+        &[("version 3", "GPL-3.0"), ("version 2", "GPL-2.0")],
+    ),
+];
+/// Bytes of normalised text, from its start, in which a GNU license name
+/// counts as the title or the notice naming the license.
+const GNU_NAME_WITHIN: usize = 600;
+/// Bytes after a GNU license name in which its version is looked for, long
+/// enough for "as published by the Free Software Foundation, either".
+const GNU_VERSION_WITHIN: usize = 120;
+
+/// Grant sentence shared by MIT and MIT-0.
+const MIT_GRANT: &str =
+    "permission is hereby granted, free of charge, to any person obtaining a copy";
+/// Grant sentence of ISC, which 0BSD ends without a condition.
+const ISC_GRANT: &str =
+    "distribute this software for any purpose with or without fee is hereby granted";
+/// Opening of every BSD license.
+const BSD_GRANT: &str = "redistribution and use in source and binary forms";
+/// Clause of BSD-3-Clause and BSD-4-Clause, in either of its usual wordings
+/// ("neither the name ... may be used to", "the name ... may not be used
+/// to"). A second BSD-3-Clause entry accepts the opening of the first
+/// wording alone.
+const BSD_ENDORSEMENT: &str = "endorse or promote products derived from this software";
+/// Clause of BSD-4-Clause.
+const BSD_ADVERTISING: &str =
+    "all advertising materials mentioning features or use of this software";
+
+/// Characteristic phrases of other common licenses, checked in order against
+/// the text lowercased with whitespace collapsed. Every phrase of an entry
+/// must appear and none of its exclusions. Exclusions keep a license from
+/// being read as a laxer relative, such as MIT as MIT-0 or BSD-3-Clause as
+/// BSD-2-Clause: a text matching no entry exactly stays unidentified, so the
+/// unclear-license warning fires rather than a wrong summary being recorded.
 const SIGNATURES: &[(&str, &[&str], &[&str])] = &[
-    (
-        "AGPL-3.0",
-        &["gnu affero general public license", "version 3"],
-        &[],
-    ),
-    (
-        "LGPL-3.0",
-        &["gnu lesser general public license", "version 3"],
-        &[],
-    ),
-    (
-        "LGPL-2.1",
-        &["gnu lesser general public license", "version 2.1"],
-        &[],
-    ),
-    ("GPL-3.0", &["gnu general public license", "version 3"], &[]),
-    ("GPL-2.0", &["gnu general public license", "version 2"], &[]),
     ("Apache-2.0", &["apache license", "version 2.0"], &[]),
     ("MPL-2.0", &["mozilla public license", "2.0"], &[]),
     (
         "MIT",
         &[
-            "permission is hereby granted, free of charge, to any person obtaining a copy",
-            "the above copyright notice and this permission notice shall be included",
+            MIT_GRANT,
+            "the above copyright notice and this permission notice shall be included in all copies",
         ],
         &[],
     ),
     (
         "MIT-0",
-        &["permission is hereby granted, free of charge, to any person obtaining a copy"],
-        &[],
+        &[MIT_GRANT, "to whom the software is furnished to do so."],
+        &[
+            "copyright notice",
+            "shall be included",
+            "subject to the following conditions",
+        ],
     ),
     (
         "ISC",
-        &["permission to use, copy, modify, and/or distribute this software for any purpose"],
-        &[],
-    ),
-    (
-        "BSD-3-Clause",
         &[
-            "redistribution and use in source and binary forms",
-            "neither the name of",
+            ISC_GRANT,
+            "provided that the above copyright notice and this permission notice appear in all copies",
         ],
         &[],
     ),
     (
+        "0BSD",
+        &["distribute this software for any purpose with or without fee is hereby granted."],
+        &["copyright notice"],
+    ),
+    (
+        "BSD-4-Clause",
+        &[BSD_GRANT, BSD_ADVERTISING, BSD_ENDORSEMENT],
+        &[],
+    ),
+    (
+        "BSD-3-Clause",
+        &[BSD_GRANT, BSD_ENDORSEMENT],
+        &["advertising materials"],
+    ),
+    (
+        "BSD-3-Clause",
+        &[BSD_GRANT, "neither the name of"],
+        &["advertising materials"],
+    ),
+    (
         "BSD-2-Clause",
-        &["redistribution and use in source and binary forms"],
-        &["neither the name of"],
+        &[BSD_GRANT],
+        // A third clause, however worded or numbered, makes it another
+        // license.
+        &["endorse", "neither the name of", "advertising", " 3. "],
     ),
     (
         "Unlicense",
@@ -76,8 +129,10 @@ const SIGNATURES: &[(&str, &[&str], &[&str])] = &[
 ];
 
 /// Identifies the license in `text`: an `SPDX-License-Identifier:` tag when
-/// present, otherwise the first known license whose characteristic phrases
-/// all appear. Returns `None` when the license cannot be identified.
+/// present, otherwise the GNU license named near the top, otherwise the
+/// first known license whose characteristic phrases all appear and none of
+/// its exclusions. Returns `None` when the license cannot be identified,
+/// including a GNU license named without a known version.
 #[must_use]
 pub fn identify(text: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(text);
@@ -93,6 +148,9 @@ pub fn identify(text: &[u8]) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase();
+    if let Some(gnu) = identify_gnu(&normalised) {
+        return gnu.map(str::to_owned);
+    }
     SIGNATURES
         .iter()
         .find(|(_, phrases, exclusions)| {
@@ -100,6 +158,29 @@ pub fn identify(text: &[u8]) -> Option<String> {
                 && !exclusions.iter().any(|phrase| normalised.contains(phrase))
         })
         .map(|(id, _, _)| (*id).to_owned())
+}
+
+/// The GNU license named first near the top of `normalised`: `None` when no
+/// GNU license is named there, `Some(None)` when its version is unknown.
+fn identify_gnu(normalised: &str) -> Option<Option<&'static str>> {
+    let (start, name, versions) = GNU_LICENSES
+        .iter()
+        .filter_map(|(name, versions)| {
+            let start = normalised.find(name)?;
+            (start < GNU_NAME_WITHIN).then_some((start, *name, *versions))
+        })
+        .min_by_key(|(start, _, _)| *start)?;
+    let after = normalised.get(start + name.len()..).unwrap_or_default();
+    Some(
+        versions
+            .iter()
+            .filter_map(|(version, id)| {
+                let at = after.find(version)?;
+                (at < GNU_VERSION_WITHIN).then_some((at, *id))
+            })
+            .min_by_key(|(at, _)| *at)
+            .map(|(_, id)| id),
+    )
 }
 
 /// A Skill whose license could not be established.
@@ -193,7 +274,7 @@ mod tests {
         let cases = [
             (MIT, "MIT"),
             (
-                "Permission is hereby granted, free of charge, to any person obtaining a copy of this software, to deal in the Software without restriction.",
+                "Permission is hereby granted, free of charge, to any person obtaining a copy of this software, to deal in the Software without restriction, and to permit persons to whom the Software is furnished to do so.",
                 "MIT-0",
             ),
             (
@@ -218,7 +299,7 @@ mod tests {
             ),
             ("Mozilla Public License Version 2.0", "MPL-2.0"),
             (
-                "Permission to use, copy, modify, and/or distribute this software for any\npurpose with or without fee is hereby granted",
+                "Permission to use, copy, modify, and/or distribute this software for any\npurpose with or without fee is hereby granted, provided that the above\ncopyright notice and this permission notice appear in all copies.",
                 "ISC",
             ),
             (
