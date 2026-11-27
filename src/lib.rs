@@ -6,5 +6,6 @@
 
 pub mod cli;
 mod error;
+pub mod safety;
 
 pub use error::Error;
