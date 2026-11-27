@@ -52,7 +52,8 @@ exceptions = []
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-# Encodes design boundaries from docs/v1-spec.md:
+# Encodes the tool's design boundaries (restated in CONTRIBUTING.md,
+# "Dependency policy"):
 # - Sources are fetched with the system `git` binary, never an embedded Git.
 # - The tool never calls a model API directly, so it needs no HTTP client.
 deny = [
