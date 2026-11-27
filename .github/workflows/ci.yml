@@ -11,10 +11,13 @@ on:
 permissions:
   contents: read
 
-# Superseded pull-request runs are cancelled; every push to main keeps its run,
-# so each merged commit gets a recorded result.
+# Superseded pull-request runs are cancelled. Every other run (pushes to main,
+# manual runs) gets its own group, because a group keeps at most one pending
+# run and replaces it when a newer one queues; sharing a group would let a
+# later merge cancel the pending run of an earlier one, leaving that merged
+# commit without a recorded result.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:

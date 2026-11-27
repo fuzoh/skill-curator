@@ -157,6 +157,16 @@ fn ci_runs_the_local_check_entrypoint() -> TestResult {
         ci.contains("cancel-in-progress: ${{ github.event_name == 'pull_request' }}"),
         "only superseded pull-request runs may be cancelled, never runs on main"
     );
+    // A concurrency group keeps at most one pending run and replaces it when a
+    // newer run queues, even without cancel-in-progress. Runs outside pull
+    // requests therefore need a group of their own, or a quick series of
+    // merges would cancel the pending run of an earlier merged commit.
+    assert!(
+        ci.contains(
+            "group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}"
+        ),
+        "each run on main must have its own concurrency group so no pending run is replaced"
+    );
     Ok(())
 }
 
