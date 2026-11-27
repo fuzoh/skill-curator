@@ -31,15 +31,48 @@ fn skill_curator(sandbox: &Path) -> Command {
     cmd
 }
 
+/// Names of the entries in the `Commands:` section of `--help` output. A
+/// command counts as listed only through its own entry, never through words in
+/// another entry's description or a wrapped description line.
+fn listed_commands(help: &str) -> Vec<&str> {
+    help.lines()
+        .skip_while(|line| line.trim_end() != "Commands:")
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.strip_prefix("  "))
+        .filter(|entry| !entry.starts_with(char::is_whitespace))
+        .filter_map(|entry| entry.split_whitespace().next())
+        .collect()
+}
+
+#[test]
+fn listed_commands_ignores_names_mentioned_only_in_descriptions() {
+    let help = "Usage: tool <COMMAND>\n\
+                \n\
+                Commands:\n  \
+                status  Report known upstream updates\n  \
+                check   Fetch Sources\n          \
+                update wrapped description line\n\
+                \n\
+                Options:\n  \
+                -h, --help  Print help\n";
+    assert_eq!(listed_commands(help), ["status", "check"]);
+}
+
 #[test]
 fn help_lists_every_v1_subcommand_and_global_flag() -> TestResult {
     let sandbox = TempDir::new()?;
-    let mut assert = skill_curator(sandbox.path())
+    let assert = skill_curator(sandbox.path())
         .arg("--help")
         .assert()
         .success();
+    let help = String::from_utf8(assert.get_output().stdout.clone())?;
+    let listed = listed_commands(&help);
     for name in SUBCOMMANDS {
-        assert = assert.stdout(predicate::str::contains(name));
+        assert!(
+            listed.contains(&name),
+            "`{name}` is not listed under Commands: in --help output:\n{help}"
+        );
     }
     assert
         .stdout(predicate::str::contains("--collection <PATH>"))
