@@ -1,0 +1,9 @@
+{
+  "path": ["src", "tests"],
+  "format": ["rust"],
+  "minTokens": 50,
+  "minLines": 5,
+  "mode": "mild",
+  "reporters": ["console", "markdown"],
+  "output": "target/jscpd"
+}

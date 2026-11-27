@@ -1,0 +1,89 @@
+# Consultative checks: mutation testing and duplicate-code detection.
+# Scheduled or run on demand only; never triggered by pushes or pull requests,
+# so findings inform review without blocking merges.
+name: Consultative checks
+
+on:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  mutants:
+    name: Mutation testing (cargo-mutants, safety-critical modules)
+    # Isolated job: fresh runner, read-only token not persisted, no secrets.
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: cargo-mutants@27.1.0
+
+      # Targets come from .cargo/mutants.toml. Missed (2) or timed-out (3)
+      # mutants are findings to review, not a failure of this advisory job;
+      # any other non-zero status means the run itself is broken.
+      - name: Run cargo-mutants
+        run: |
+          set +e
+          cargo mutants
+          status=$?
+          case "$status" in
+            0) ;;
+            2|3) echo "::warning::cargo-mutants reported missed or timed-out mutants (status $status); review the mutants.out artifact" ;;
+            *) exit "$status" ;;
+          esac
+
+      - name: Upload mutants.out
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutants.out
+          path: mutants.out
+          if-no-files-found: ignore
+
+  duplication:
+    name: Duplicate-code report (jscpd v5, advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # jscpd v5 is a Rust binary: a development-only tool, never a runtime
+      # dependency of skill-curator, and no Node or Bun is involved.
+      - name: Install jscpd
+        run: cargo install --locked jscpd --version 5.4.3
+
+      # Configuration in .jscpd.json; no threshold is set, so the job reports
+      # clones without failing.
+      - name: Run jscpd
+        run: jscpd --config .jscpd.json
+
+      - name: Upload duplication report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: jscpd-report
+          path: target/jscpd
+          if-no-files-found: ignore
