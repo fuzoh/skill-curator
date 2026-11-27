@@ -1,7 +1,7 @@
 # Design ideas and open questions
 
-Status: proposals only. No architecture, command names, or file formats have been
-selected.
+Status: exploratory proposals except for the decisions linked under **Planning
+map**. Command names and file formats have not been selected.
 
 ## Possible content lifecycle
 
@@ -88,18 +88,18 @@ sent to an external provider.
 ## Decisions to explore
 
 - Who is the first user, and what is the smallest useful update workflow?
-- Which existing skill installers overlap with this goal, and where should this
-  tool integrate rather than duplicate their work?
+- Which source-layout conventions should be reused from existing installers?
+  Independence from `npx skills` is settled; see **Technical foundation** below.
 - Which source layouts and supporting-file conventions should be supported first?
-- Should fetching use Git clones, archives, or an existing installer?
+- How should fetching and caching use the allowed system Git prerequisite?
 - How should skill identity survive renames, moves, or source removal?
 - Which adaptations can be deterministic, and which need model assistance?
 - How are conflicts, review approval, rollback, and local edits represented?
 - Which target environment should be validated first?
 - Should installation copy, link, or export content to another tool?
 - What belongs in a portable manifest versus machine-local configuration?
-- Which language, distribution mechanism, and license-compatible dependencies fit
-  the validated scope?
+- Which exact crate versions, features, and dependency-policy settings fit the
+  validated scope? Language and initial distribution are settled below.
 
 ## Suggested next step
 
@@ -126,3 +126,15 @@ Settled while charting the map (2026-11-05):
   result.
 - Out of scope for the first version: sandbox capability declarations,
   per-environment variants, other harnesses, hosted registry, bundling.
+
+### Technical foundation
+
+Resolved on 2026-11-16 in
+[Drive or replace npx skills, and implementation language](https://github.com/fuzoh/skill-curator/issues/7):
+independent Rust CLI, defensive coexistence with `npx skills`, system Git,
+Cargo/source installation, and a strict agent-oriented development harness
+inspired by `ub-mode`. The resolution holds the accepted requirements; the
+future implementation-spec breakdown must carry them into a bootstrap issue.
+Supporting tooling evidence lives in
+[Rust quality tooling: tests, mutation, duplication, and lint](https://github.com/fuzoh/skill-curator/issues/28).
+No Rust setup has been implemented.
