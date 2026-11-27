@@ -130,6 +130,11 @@ pub enum HashError {
         /// Path of the entry.
         path: PathBuf,
     },
+    /// The root of the tree is not a directory.
+    NotADirectory {
+        /// Path of the root.
+        path: PathBuf,
+    },
     /// A file or directory name is not valid UTF-8, so it has no portable
     /// representation.
     NonUtf8Name {
@@ -152,6 +157,7 @@ impl fmt::Display for HashError {
                 "{} is neither a regular file nor a directory",
                 path.display()
             ),
+            Self::NotADirectory { path } => write!(f, "{} is not a directory", path.display()),
             Self::NonUtf8Name { path } => {
                 write!(f, "{} has a name that is not valid UTF-8", path.display())
             }
@@ -192,9 +198,22 @@ fn update_len(hasher: &mut Sha256, len: usize) {
 ///
 /// # Errors
 ///
-/// Returns a [`HashError`] when the tree cannot be read or contains a
-/// symbolic link, a special file, or a name that is not valid UTF-8.
+/// Returns a [`HashError`] when the tree cannot be read, `root` itself is a
+/// symbolic link or not a directory, or the tree contains a symbolic link, a
+/// special file, or a name that is not valid UTF-8.
 pub fn tree_digest(root: &Path) -> Result<Digest, HashError> {
+    let root_type = fs::symlink_metadata(root)
+        .map_err(io_error(root))?
+        .file_type();
+    if root_type.is_symlink() {
+        return Err(HashError::Symlink {
+            path: root.to_path_buf(),
+        });
+    } else if !root_type.is_dir() {
+        return Err(HashError::NotADirectory {
+            path: root.to_path_buf(),
+        });
+    }
     let mut files = Vec::new();
     collect_files(root, "", &mut files)?;
     files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -437,6 +456,21 @@ mod tests {
             tree_digest(dir.path()),
             Err(HashError::Symlink { .. })
         ));
+    }
+
+    #[test]
+    fn tree_digest_rejects_a_symlinked_or_non_directory_root() {
+        let outside = tree(SKILL);
+        let dir = TempDir::new().unwrap();
+        let link = dir.path().join("skill");
+        symlink(outside.path(), &link).unwrap();
+        let err = tree_digest(&link).unwrap_err();
+        assert!(matches!(err, HashError::Symlink { ref path } if *path == link));
+
+        let file = outside.path().join("SKILL.md");
+        let err = tree_digest(&file).unwrap_err();
+        assert!(matches!(err, HashError::NotADirectory { ref path } if *path == file));
+        assert!(err.to_string().ends_with("is not a directory"));
     }
 
     #[test]
