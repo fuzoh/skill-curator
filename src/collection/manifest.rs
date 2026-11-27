@@ -5,7 +5,7 @@
 //! and unknown Skill modes or harness types; [`Manifest::problems`] then checks
 //! references between entries.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -319,10 +319,18 @@ impl Manifest {
 
     /// Reference and consistency problems that parsing alone cannot catch:
     /// undefined Sources and presets, missing intents for Compositions,
-    /// intents and Fragments outside their directories, contradictory D1
-    /// rules, and Destinations without a Skills directory.
+    /// intents and Fragments outside their directories, repeated presets,
+    /// Fragments, or Composition inputs, contradictory D1 rules, Source URLs
+    /// and branches `git` could misread, and Destinations without a Skills
+    /// directory.
+    ///
+    /// Paths shared between Destinations are checked once machine-local
+    /// settings apply (see [`MachineConfig::resolve`]), because only enabled
+    /// Destinations write anything.
     ///
     /// Does not touch the filesystem.
+    ///
+    /// [`MachineConfig::resolve`]: super::machine::MachineConfig::resolve
     #[must_use]
     pub fn problems(&self) -> Vec<Problem> {
         let mut problems = Vec::new();
@@ -339,20 +347,8 @@ impl Manifest {
         for (name, skill) in &self.skills {
             self.check_skill(name, skill, &mut problems);
         }
-        let mut instruction_files = BTreeMap::new();
         for (name, destination) in &self.destinations {
             check_destination(name, destination, &mut problems);
-            if let Some(instructions) = &destination.instructions
-                && let Some(other) = instruction_files.insert(&instructions.file, name)
-            {
-                problems.push(Problem::new(
-                    format!("destinations.{name}.instructions.file"),
-                    format!(
-                        "`{}` is already assembled by Destination `{other}`; each global instruction file belongs to one Destination",
-                        instructions.file
-                    ),
-                ));
-            }
         }
         problems
     }
@@ -363,8 +359,14 @@ impl Manifest {
             Skill::Copy(copy) => self.check_source_ref(&at, &copy.source, problems),
             Skill::Adapt(adapt) => {
                 self.check_source_ref(&at, &adapt.source, problems);
+                let mut listed = BTreeSet::new();
                 for preset in &adapt.presets {
-                    if !self.presets.contains_key(preset) {
+                    if !listed.insert(preset) {
+                        problems.push(Problem::new(
+                            format!("{at}.presets"),
+                            format!("preset `{preset}` is listed more than once; list it once"),
+                        ));
+                    } else if !self.presets.contains_key(preset) {
                         problems.push(Problem::new(
                             format!("{at}.presets"),
                             format!(
@@ -389,12 +391,21 @@ impl Manifest {
                         ),
                     ));
                 }
+                let mut upstream_skills = BTreeMap::new();
                 for (input_name, input) in &composition.inputs {
-                    self.check_source_ref(
-                        &format!("{at}.inputs.{input_name}"),
-                        &input.source,
-                        problems,
-                    );
+                    let input_at = format!("{at}.inputs.{input_name}");
+                    self.check_source_ref(&input_at, &input.source, problems);
+                    if let Some(other) =
+                        upstream_skills.insert((&input.source, &input.upstream_path), input_name)
+                    {
+                        problems.push(Problem::new(
+                            input_at,
+                            format!(
+                                "input `{other}` already takes `{}` from Source `{}`; each input must name a different upstream Skill",
+                                input.upstream_path, input.source
+                            ),
+                        ));
+                    }
                 }
                 match &composition.intent {
                     Some(intent) => {
@@ -440,33 +451,55 @@ fn known<'a>(names: impl Iterator<Item = &'a Name>) -> String {
     }
 }
 
-/// Rejects values that `git` could read as a command-line option, and
-/// whitespace or control characters.
-fn check_git_argument(at: String, what: &str, value: &str, problems: &mut Vec<Problem>) {
+/// Why `git` could misread `value` as a command-line argument: it is empty,
+/// starts like an option, or holds whitespace or control characters.
+fn git_argument_problem(what: &str, value: &str) -> Option<String> {
     if value.is_empty() {
-        problems.push(Problem::new(at, format!("the {what} is empty")));
+        Some(format!("the {what} is empty"))
     } else if value.starts_with('-') {
-        problems.push(Problem::new(
-            at,
-            format!("the {what} must not start with `-`, which `git` would read as an option"),
-        ));
+        Some(format!(
+            "the {what} must not start with `-`, which `git` would read as an option"
+        ))
     } else if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        problems.push(Problem::new(
-            at,
-            format!("the {what} must not contain whitespace or control characters"),
-        ));
+        Some(format!(
+            "the {what} must not contain whitespace or control characters"
+        ))
+    } else {
+        None
     }
 }
 
+/// Why `branch` is not a plain branch name under the `git check-ref-format`
+/// rules, or could be read as a refspec (`src:dst`, or a leading `+` that
+/// forces an update) or a revision expression (`a..b`, `@{1}`, `~`, `^`).
+fn branch_problem(branch: &str) -> Option<String> {
+    if let Some(problem) = git_argument_problem("branch", branch) {
+        return Some(problem);
+    }
+    let invalid = branch == "@"
+        || branch.starts_with('+')
+        || branch.contains("..")
+        || branch.contains("@{")
+        || branch
+            .chars()
+            .any(|c| matches!(c, ':' | '~' | '^' | '?' | '*' | '[' | '\\'))
+        || branch.ends_with('.')
+        || branch
+            .split('/')
+            .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"));
+    invalid.then(|| {
+        format!(
+            "`{branch}` is not a plain Git branch name; write the branch alone, such as `main`, without `:`, a leading `+`, `..`, `@{{`, `~`, `^`, `?`, `*`, `[`, `\\`, empty or `.`-prefixed `/` parts, or a `.lock` suffix"
+        )
+    })
+}
+
 fn check_source(name: &Name, source: &Source, problems: &mut Vec<Problem>) {
-    check_git_argument(
-        format!("sources.{name}.url"),
-        "repository URL",
-        &source.url,
-        problems,
-    );
-    if let Some(branch) = &source.branch {
-        check_git_argument(format!("sources.{name}.branch"), "branch", branch, problems);
+    if let Some(problem) = git_argument_problem("repository URL", &source.url) {
+        problems.push(Problem::new(format!("sources.{name}.url"), problem));
+    }
+    if let Some(problem) = source.branch.as_deref().and_then(branch_problem) {
+        problems.push(Problem::new(format!("sources.{name}.branch"), problem));
     }
 }
 
@@ -477,6 +510,18 @@ fn check_frontmatter(at: &str, rules: &FrontmatterRules, problems: &mut Vec<Prob
                 at.to_owned(),
                 format!("key `{key}` is both set and removed; keep only one of the two rules"),
             ));
+        }
+    }
+    if let Some(keep_only) = &rules.keep_only {
+        for key in rules.set.keys() {
+            if !keep_only.contains(key) {
+                problems.push(Problem::new(
+                    at.to_owned(),
+                    format!(
+                        "key `{key}` is set but not listed in `keep_only`, which drops it; add it to `keep_only` or remove the `set` rule"
+                    ),
+                ));
+            }
         }
     }
 }
@@ -502,13 +547,16 @@ fn check_destination(name: &Name, destination: &Destination, problems: &mut Vec<
         ));
     }
     if let Some(instructions) = &destination.instructions {
+        let fragments_at = format!("{at}.instructions.fragments");
+        let mut listed = BTreeSet::new();
         for fragment in &instructions.fragments {
-            check_under(
-                &format!("{at}.instructions.fragments"),
-                fragment,
-                FRAGMENTS_DIR,
-                problems,
-            );
+            check_under(&fragments_at, fragment, FRAGMENTS_DIR, problems);
+            if !listed.insert(fragment) {
+                problems.push(Problem::new(
+                    fragments_at.clone(),
+                    format!("Fragment `{fragment}` is listed more than once; list it once"),
+                ));
+            }
         }
     }
     check_frontmatter(
@@ -943,6 +991,55 @@ skills_dir = "/srv/agents/skills"
                 "presets.p.frontmatter: key `icon` is both set and removed; keep only one of the two rules"
             ]
         );
+
+        let found = problems(
+            "[presets.p.frontmatter]\nset = { icon = 'x', name = 'n' }\nkeep_only = ['name', 'description']\n",
+        );
+        assert_eq!(
+            found,
+            [
+                "presets.p.frontmatter: key `icon` is set but not listed in `keep_only`, which drops it; add it to `keep_only` or remove the `set` rule"
+            ]
+        );
+    }
+
+    #[test]
+    fn reports_branches_that_are_not_plain_branch_names() {
+        for branch in ["main", "release/1.x", "feat-a_b", "v1.0", "a+b"] {
+            let found = problems(&format!("[sources.s]\nurl = 'u'\nbranch = '{branch}'\n"));
+            assert_eq!(found, Vec::<String>::new(), "{branch}");
+        }
+        for branch in [
+            "main:refs/heads/evil",
+            "+main",
+            "a..b",
+            "HEAD@{1}",
+            "@",
+            "main~1",
+            "main^",
+            "ma?n",
+            "ma*n",
+            "ma[n",
+            "a\\b",
+            "/main",
+            "main/",
+            "a//b",
+            ".hidden",
+            "a/.b",
+            "main.lock",
+            "main.",
+        ] {
+            let found = problems(&format!(
+                "[sources.s]\nurl = 'u'\nbranch = '''{branch}'''\n"
+            ));
+            assert_eq!(found.len(), 1, "{branch}: {found:?}");
+            assert!(
+                found[0].starts_with(&format!(
+                    "sources.s.branch: `{branch}` is not a plain Git branch name"
+                )),
+                "{found:?}"
+            );
+        }
     }
 
     #[test]
@@ -957,17 +1054,42 @@ skills_dir = "/srv/agents/skills"
     }
 
     #[test]
-    fn reports_instruction_files_shared_by_destinations() {
+    fn leaves_shared_instruction_files_to_machine_settings() {
+        // Two machines may each enable one of two Destinations that assemble
+        // the same file from different Fragments; `MachineConfig::resolve`
+        // rejects the pair only when both are enabled on one machine.
         let found = problems(
-            "[destinations.a]\nharness = 'pi'\ninstructions = { file = '~/AGENTS.md', fragments = [] }\n\
-             [destinations.b]\nharness = 'codex'\ninstructions = { file = '~//AGENTS.md', fragments = [] }\n",
+            "[destinations.laptop]\nharness = 'claude-code'\ninstructions = { file = '~/.claude/CLAUDE.md', fragments = ['fragments/a.md'] }\n\
+             [destinations.server]\nharness = 'claude-code'\nenabled = false\ninstructions = { file = '~/.claude/CLAUDE.md', fragments = ['fragments/b.md'] }\n",
+        );
+        assert_eq!(found, Vec::<String>::new());
+    }
+
+    #[test]
+    fn reports_repeated_presets_fragments_and_composition_inputs() {
+        let found = problems(
+            "[sources.s]\nurl = 'u'\n[presets.p]\n\
+             [skills.a]\nmode = 'adapt'\nsource = 's'\nupstream_path = 'a'\npresets = ['p', 'p']\n\
+             [skills.c]\nmode = 'composition'\nintent = 'intents/c.md'\n\
+             [skills.c.inputs.one]\nsource = 's'\nupstream_path = 'x'\n\
+             [skills.c.inputs.two]\nsource = 's'\nupstream_path = './x/'\nfiles = { exclude = ['*.png'] }\n\
+             [destinations.d]\nharness = 'pi'\ninstructions = { file = '~/AGENTS.md', fragments = ['fragments/a.md', 'fragments//a.md'] }\n",
         );
         assert_eq!(
             found,
             [
-                "destinations.b.instructions.file: `~/AGENTS.md` is already assembled by Destination `a`; each global instruction file belongs to one Destination"
+                "skills.a.presets: preset `p` is listed more than once; list it once",
+                "skills.c.inputs.two: input `one` already takes `x` from Source `s`; each input must name a different upstream Skill",
+                "destinations.d.instructions.fragments: Fragment `fragments/a.md` is listed more than once; list it once",
             ]
         );
+        // The same upstream path from two Sources is two upstream Skills.
+        let found = problems(
+            "[sources.s]\nurl = 'u'\n[sources.t]\nurl = 'v'\n[skills.c]\nmode = 'composition'\nintent = 'intents/c.md'\n\
+             [skills.c.inputs.one]\nsource = 's'\nupstream_path = 'x'\n\
+             [skills.c.inputs.two]\nsource = 't'\nupstream_path = 'x'\n",
+        );
+        assert_eq!(found, Vec::<String>::new());
     }
 
     #[test]
