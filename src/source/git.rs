@@ -4,7 +4,8 @@
 //! `ext::` transport, submodule recursion, and automatic garbage collection
 //! disabled, with replace objects ignored, without standard input, and with
 //! the environment variables that would redirect Git to another repository
-//! removed. Nothing downloaded from a Source is ever executed.
+//! removed. Messages are untranslated (`LC_ALL=C`), so diagnostics can be
+//! recognised. Nothing downloaded from a Source is ever executed.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -100,6 +101,8 @@ impl Git {
         for var in REPOSITORY_ENV {
             command.env_remove(var);
         }
+        // Untranslated messages, so callers can recognise diagnostics.
+        command.env_remove("LANGUAGE").env("LC_ALL", "C");
         command.envs(self.env.iter().map(|(key, value)| (key, value)));
         command.arg("--no-replace-objects");
         for setting in SAFE_CONFIG {

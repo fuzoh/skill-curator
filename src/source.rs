@@ -43,6 +43,15 @@ const SOURCES_DIR: &str = "sources";
 const URL_HASH_LEN: usize = 16;
 /// Reference holding the tip last fetched from the Source's branch.
 const CANDIDATE_REF: &str = "refs/skill-curator/candidate";
+/// What `git fetch` reports when the remote was reached but does not have
+/// the object or reference asked for, as opposed to a transport or
+/// authentication failure. `git` runs with `LC_ALL=C`, so these are not
+/// translated.
+const REMOTE_LACKS_OBJECT: &[&str] = &[
+    "not our ref",
+    "no such remote ref",
+    "couldn't find remote ref",
+];
 
 /// Failure to fetch a Source or extract a Skill from it.
 #[derive(Debug)]
@@ -90,9 +99,11 @@ pub enum SourceError {
         /// What is wrong.
         problem: String,
     },
-    /// The Revision is neither in the cache nor available upstream, for
-    /// example after an upstream history rewrite. Callers comparing an old
-    /// and a new Revision can fall back to the new one alone.
+    /// The Revision is not in the cache and the Source, once reached, does
+    /// not provide it, for example after an upstream history rewrite. A
+    /// Source that cannot be reached at all is a [`SourceError::Git`]
+    /// instead. Callers comparing an old and a new Revision can fall back to
+    /// the new one alone.
     RevisionUnreachable {
         /// Source name in the Manifest.
         source_name: Name,
@@ -332,12 +343,14 @@ impl SourceCache {
     ///
     /// # Errors
     ///
-    /// Returns [`SourceError::RevisionUnreachable`] when the Revision is
-    /// neither cached nor available upstream, [`SourceError::SkillNotFound`]
-    /// with nearby Skill directories when `upstream_path` is not a Skill
-    /// directory at the Revision, [`SourceError::UnsafeSkill`] when it holds
-    /// entries that cannot be extracted safely, and another [`SourceError`]
-    /// when `git` or the filesystem fails.
+    /// Returns [`SourceError::RevisionUnreachable`] when the Revision is not
+    /// cached and the Source, once reached, does not provide it,
+    /// [`SourceError::SkillNotFound`] with nearby Skill directories when
+    /// `upstream_path` is not a Skill directory at the Revision,
+    /// [`SourceError::UnsafeSkill`] when it holds entries that cannot be
+    /// extracted safely, and another [`SourceError`] when `git` or the
+    /// filesystem fails, including a [`SourceError::Git`] when the Revision
+    /// is not cached and the Source cannot be reached.
     pub fn extract(
         &self,
         name: &Name,
@@ -512,7 +525,16 @@ impl SourceCache {
             };
             match self.fetch_from(repository, &source.url, revision.as_str()) {
                 Ok(()) => {}
-                Err(SourceError::Git { stderr, .. }) => return Err(unreachable(stderr)),
+                // Only a remote that answered without the object means the
+                // Revision is gone. A transport or authentication failure
+                // stays a fetch error, since the Revision may still exist.
+                Err(SourceError::Git { stderr, .. })
+                    if REMOTE_LACKS_OBJECT
+                        .iter()
+                        .any(|diagnostic| stderr.contains(diagnostic)) =>
+                {
+                    return Err(unreachable(stderr));
+                }
                 Err(err) => return Err(err),
             }
             if !self.has_commit(repository, revision)? {

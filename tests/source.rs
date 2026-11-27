@@ -366,6 +366,43 @@ fn a_branch_can_change_to_a_nested_or_parent_name() -> TestResult {
 }
 
 #[test]
+fn an_unreachable_source_is_a_fetch_failure_not_a_rewrite() -> TestResult {
+    let sandbox = Sandbox::new()?;
+    let upstream = sandbox.upstream("upstream")?;
+    upstream.write("skills/a/SKILL.md", "1\n")?;
+    let first = upstream.commit("first")?;
+
+    let cache = sandbox.cache();
+    let source_name = name("s")?;
+    let source = upstream.source();
+    assert_eq!(cache.fetch(&source_name, &source)?, first);
+    upstream.write("skills/a/SKILL.md", "2\n")?;
+    let uncached = upstream.commit("second")?;
+
+    // The Source goes offline, as on a network or authentication failure.
+    let offline = sandbox.dir.path().join("offline.git");
+    fs::rename(&upstream.repository, &offline)?;
+    let err = cache
+        .extract(&source_name, &source, &uncached, &path("skills/a")?)
+        .err()
+        .ok_or("an unreachable Source must fail")?;
+    assert!(
+        matches!(&err, SourceError::Git { command, .. } if command == "git fetch"),
+        "{err:?}"
+    );
+    assert!(!err.to_string().contains("rewritten"), "{err}");
+    // Cached Revisions still extract offline.
+    let cached = cache.extract(&source_name, &source, &first, &path("skills/a")?)?;
+    assert_eq!(read(&cached, SKILL_FILE)?, "1\n");
+
+    // Back online, the same Revision is fetched by identifier.
+    fs::rename(&offline, &upstream.repository)?;
+    let fetched = cache.extract(&source_name, &source, &uncached, &path("skills/a")?)?;
+    assert_eq!(read(&fetched, SKILL_FILE)?, "2\n");
+    Ok(())
+}
+
+#[test]
 fn an_unreachable_old_revision_is_reported_distinctly() -> TestResult {
     let sandbox = Sandbox::new()?;
     let upstream = sandbox.upstream("upstream")?;
