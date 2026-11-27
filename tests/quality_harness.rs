@@ -31,35 +31,41 @@ fn lookup_str<'a>(table: &'a Table, dotted: &str) -> Option<&'a str> {
     lookup(table, dotted).and_then(toml::Value::as_str)
 }
 
+/// Rust release pinned by `rust-toolchain.toml`.
+fn pinned_toolchain() -> Result<String, Box<dyn Error>> {
+    let toolchain = repo_toml("rust-toolchain.toml")?;
+    Ok(lookup_str(&toolchain, "toolchain.channel")
+        .ok_or("missing channel")?
+        .to_owned())
+}
+
 #[test]
 fn production_code_denies_unwrap_and_expect() -> TestResult {
     let manifest = repo_toml("Cargo.toml")?;
-    assert_eq!(
-        lookup_str(&manifest, "lints.clippy.unwrap_used"),
-        Some("deny")
-    );
-    assert_eq!(
-        lookup_str(&manifest, "lints.clippy.expect_used"),
-        Some("deny")
-    );
-    assert_eq!(
-        lookup_str(&manifest, "lints.clippy.allow_attributes_without_reason"),
-        Some("deny")
-    );
+    for lint in [
+        "unwrap_used",
+        "expect_used",
+        "allow_attributes_without_reason",
+    ] {
+        assert_eq!(
+            lookup_str(&manifest, &format!("lints.clippy.{lint}")),
+            Some("deny"),
+            "clippy::{lint} must be denied"
+        );
+    }
     Ok(())
 }
 
 #[test]
 fn tests_keep_a_scoped_unwrap_and_expect_exception() -> TestResult {
     let clippy = repo_toml("clippy.toml")?;
-    assert_eq!(
-        lookup(&clippy, "allow-unwrap-in-tests").and_then(toml::Value::as_bool),
-        Some(true)
-    );
-    assert_eq!(
-        lookup(&clippy, "allow-expect-in-tests").and_then(toml::Value::as_bool),
-        Some(true)
-    );
+    for key in ["allow-unwrap-in-tests", "allow-expect-in-tests"] {
+        assert_eq!(
+            lookup(&clippy, key).and_then(toml::Value::as_bool),
+            Some(true),
+            "clippy.toml must set {key} = true"
+        );
+    }
     Ok(())
 }
 
@@ -80,8 +86,7 @@ fn no_blanket_clippy_groups_are_enabled() -> TestResult {
 
 #[test]
 fn toolchain_is_pinned_to_an_exact_release() -> TestResult {
-    let toolchain = repo_toml("rust-toolchain.toml")?;
-    let channel = lookup_str(&toolchain, "toolchain.channel").ok_or("missing channel")?;
+    let channel = pinned_toolchain()?;
     let parts = channel.split('.').collect::<Vec<_>>();
     assert_eq!(
         parts.len(),
@@ -226,8 +231,7 @@ fn check_script_with_rust(
 #[cfg(unix)]
 #[test]
 fn check_script_refuses_a_toolchain_other_than_the_pinned_one() -> TestResult {
-    let toolchain = repo_toml("rust-toolchain.toml")?;
-    let pinned = lookup_str(&toolchain, "toolchain.channel").ok_or("missing channel")?;
+    let pinned = pinned_toolchain()?;
     let sandbox = tempfile::TempDir::new()?;
     let (mut cmd, log) = check_script_with_rust(sandbox.path(), "0.0.1")?;
 
@@ -243,10 +247,9 @@ fn check_script_refuses_a_toolchain_other_than_the_pinned_one() -> TestResult {
 #[cfg(unix)]
 #[test]
 fn check_script_runs_every_blocking_check_on_the_pinned_toolchain() -> TestResult {
-    let toolchain = repo_toml("rust-toolchain.toml")?;
-    let pinned = lookup_str(&toolchain, "toolchain.channel").ok_or("missing channel")?;
+    let pinned = pinned_toolchain()?;
     let sandbox = tempfile::TempDir::new()?;
-    let (mut cmd, log) = check_script_with_rust(sandbox.path(), pinned)?;
+    let (mut cmd, log) = check_script_with_rust(sandbox.path(), &pinned)?;
 
     cmd.assert().success();
     assert_eq!(
