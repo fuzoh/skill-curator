@@ -11,9 +11,11 @@ on:
 permissions:
   contents: read
 
+# Superseded pull-request runs are cancelled; every push to main keeps its run,
+# so each merged commit gets a recorded result.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always

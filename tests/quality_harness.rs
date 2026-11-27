@@ -153,6 +153,10 @@ fn ci_runs_the_local_check_entrypoint() -> TestResult {
     assert!(ci.contains("run: ./scripts/check.sh"));
     assert!(ci.contains("\n  pull_request:"));
     assert!(ci.contains("\n  push:"));
+    assert!(
+        ci.contains("cancel-in-progress: ${{ github.event_name == 'pull_request' }}"),
+        "only superseded pull-request runs may be cancelled, never runs on main"
+    );
     Ok(())
 }
 
