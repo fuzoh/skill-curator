@@ -1,0 +1,5 @@
+# Scoped test exception for the `unwrap_used` and `expect_used` lints denied in
+# Cargo.toml: they stay denied in production code but are allowed inside
+# `#[test]` functions and `#[cfg(test)]` modules.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

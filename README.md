@@ -3,8 +3,21 @@
 A configurable tool for downloading, adapting, and maintaining AI coding-agent
 skills on the user's machine.
 
-**Status: exploratory.** This repository contains planning documents only; there
-is no implementation or installable package yet.
+**Status: early development.** The Rust command-line skeleton exists; its
+commands (`status`, `check`, `update`, `materialize`, `install`) are not
+implemented yet.
+
+## Building
+
+Requires Rust (the release pinned in `rust-toolchain.toml`) and, at runtime,
+system `git`.
+
+```sh
+cargo build
+cargo run -- --help
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the quality checks.
 
 ## Goals
 

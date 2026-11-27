@@ -1,0 +1,6 @@
+# Fixed toolchain so local checks and CI see the same rustfmt and Clippy
+# behaviour. Bump deliberately, in its own commit, and fix any new findings.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
