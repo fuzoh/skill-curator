@@ -5,6 +5,7 @@
 //! this library so it can be exercised by unit and integration tests.
 
 pub mod cli;
+pub mod collection;
 mod error;
 pub mod hash;
 pub mod safety;
