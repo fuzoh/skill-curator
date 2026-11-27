@@ -36,6 +36,18 @@ jobs:
         with:
           tool: cargo-mutants@27.1.0
 
+      # An empty selection means .cargo/mutants.toml no longer matches the
+      # safety-critical modules. cargo-mutants would then exit 0 without
+      # testing anything, so fail this advisory job to make the gap visible.
+      - name: Require targeted mutants
+        run: |
+          mutants="$(cargo mutants --list)"
+          if [ -z "$mutants" ]; then
+            echo "::error file=.cargo/mutants.toml::examine_globs match no mutants; list the safety-critical modules (path validation, overwrite protection, Revision selection, conflict handling) in .cargo/mutants.toml"
+            exit 1
+          fi
+          echo "cargo-mutants selected $(printf '%s\n' "$mutants" | wc -l) mutants"
+
       # Targets come from .cargo/mutants.toml. Missed (2) or timed-out (3)
       # mutants are findings to review, not a failure of this advisory job;
       # any other non-zero status means the run itself is broken.

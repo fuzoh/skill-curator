@@ -109,6 +109,9 @@ cargo mutants
 `.cargo/mutants.toml` restricts mutation to safety-critical modules: path
 validation, overwrite protection, Revision selection, and conflict handling.
 When you add or move such a module, list its files there in the same change.
+The workflow fails when the configured globs select no mutant, because
+cargo-mutants would otherwise report success without testing anything; that
+failure still blocks no pull request.
 
 Run it only in a disposable environment (a container or CI runner) without
 personal data or credentials mounted: a mutated deletion path can escape a

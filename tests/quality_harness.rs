@@ -253,6 +253,11 @@ fn consultative_checks_never_gate_pushes_or_pull_requests() -> TestResult {
     assert!(!workflow.contains("\n  push:"));
     assert!(!workflow.contains("\n  pull_request"));
     assert!(workflow.contains("cargo mutants"));
+    assert!(
+        workflow.contains("mutants=\"$(cargo mutants --list)\"")
+            && workflow.contains("if [ -z \"$mutants\" ]; then"),
+        "an empty mutation selection must fail the job instead of passing silently"
+    );
     assert!(workflow.contains("jscpd --config .jscpd.json"));
 
     let mutants = repo_toml(".cargo/mutants.toml")?;

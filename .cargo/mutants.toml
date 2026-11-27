@@ -3,7 +3,9 @@
 # Mutation testing is targeted at safety-critical modules only: path
 # validation (symlinks, path traversal), overwrite protection, Revision
 # selection, and update conflict handling. When a change introduces or moves
-# such a module, list its files here in the same change.
+# such a module, list its files here in the same change. The consultative
+# workflow fails when these globs select no mutant, so a stale list (or one
+# written before the modules exist) is reported instead of passing silently.
 #
 # Run it only in a disposable environment without personal data or
 # credentials: a mutated deletion path can escape its temporary directory.
