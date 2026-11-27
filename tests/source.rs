@@ -3,11 +3,12 @@
 //! network or the user's Git configuration.
 
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 use skill_curator::collection::SKILL_FILE;
 use skill_curator::collection::attribution;
@@ -65,44 +66,68 @@ impl Sandbox {
         SourceCache::new(self.dir.path().join(dir), self.git())
     }
 
-    /// A new upstream repository on branch `main`.
+    /// A new bare upstream repository on branch `main`, with a separate
+    /// working tree to prepare its commits in.
     fn upstream(&self, name: &str) -> Result<Upstream, Box<dyn Error>> {
         let upstream = Upstream {
             dir: self.dir.path().join(name),
+            repository: self.dir.path().join(format!("{name}.git")),
             env: self.env(),
         };
         fs::create_dir(&upstream.dir)?;
-        upstream.git(&["init", "--quiet", "--initial-branch=main"])?;
+        let mut init = upstream.command();
+        init.args(["init", "--quiet", "--bare", "--initial-branch=main"])
+            .arg(&upstream.repository);
+        finish(init.output()?, &["init"])?;
         Ok(upstream)
     }
 }
 
-/// An upstream Source repository with a working tree.
+/// An upstream Source: a bare repository, which the Source URL points at,
+/// and a working tree outside it where the tests prepare commits.
 struct Upstream {
+    /// Working tree.
     dir: PathBuf,
+    /// Bare repository.
+    repository: PathBuf,
     env: Vec<(&'static str, PathBuf)>,
 }
 
 impl Upstream {
     fn source(&self) -> Source {
         Source {
-            url: format!("file://{}", self.dir.display()),
+            url: format!("file://{}", self.repository.display()),
             branch: None,
         }
+    }
+
+    /// `git` in the working tree, isolated from the user's configuration.
+    fn command(&self) -> Command {
+        let mut command = Command::new("git");
+        command
+            .current_dir(&self.dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
+            .envs(self.env.iter().map(|(key, value)| (*key, value)));
+        command
     }
 
     fn git(&self, args: &[&str]) -> Result<String, Box<dyn Error>> {
         self.git_with_input(args, None)
     }
 
+    /// Runs `git` on the bare repository and the working tree.
     fn git_with_input(&self, args: &[&str], input: Option<&str>) -> Result<String, Box<dyn Error>> {
-        let mut child = Command::new("git")
+        let mut git_dir = OsString::from("--git-dir=");
+        git_dir.push(&self.repository);
+        let mut work_tree = OsString::from("--work-tree=");
+        work_tree.push(&self.dir);
+        let mut child = self
+            .command()
+            .arg(git_dir)
+            .arg(work_tree)
             .args(args)
-            .current_dir(&self.dir)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_WORK_TREE")
-            .envs(self.env.iter().map(|(key, value)| (*key, value)))
             .env("GIT_AUTHOR_NAME", "Upstream")
             .env("GIT_AUTHOR_EMAIL", "upstream@example.com")
             .env("GIT_COMMITTER_NAME", "Upstream")
@@ -119,15 +144,7 @@ impl Upstream {
                 .write_all(input.as_bytes())?;
         }
         drop(child.stdin.take());
-        let output = child.wait_with_output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .into());
-        }
-        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        finish(child.wait_with_output()?, args)
     }
 
     fn write(&self, relative: &str, contents: &str) -> TestResult {
@@ -164,6 +181,18 @@ impl Upstream {
         self.git(&["cat-file", "-e", &format!("{revision}^{{commit}}")])
             .is_ok()
     }
+}
+
+/// The trimmed standard output of a successful `git` command.
+fn finish(output: Output, args: &[&str]) -> Result<String, Box<dyn Error>> {
+    if !output.status.success() {
+        return Err(format!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
 fn name(raw: &str) -> Result<Name, Box<dyn Error>> {
@@ -214,6 +243,12 @@ fn clones_fetches_and_extracts_old_and_new_revisions() -> TestResult {
     upstream.write("skills/grill-me/references/questions.md", "Why?\n")?;
     upstream.write("skills/other/SKILL.md", "other\n")?;
     let r_old = upstream.commit("first")?;
+
+    assert_eq!(
+        upstream.git(&["config", "core.bare"])?,
+        "true",
+        "the Source is a bare repository"
+    );
 
     let cache = sandbox.cache();
     let source = upstream.source();
