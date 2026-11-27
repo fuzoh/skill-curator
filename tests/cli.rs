@@ -19,16 +19,57 @@ const USAGE_ERROR: i32 = 2;
 const FAILURE: i32 = 1;
 
 /// Builds a `skill-curator` invocation isolated from the user's real home,
-/// configuration, and working directory.
+/// configuration, working directory, and environment. The inherited
+/// environment is cleared so that variables from the caller's shell (for
+/// example `CLICOLOR_FORCE`, which makes clap emit ANSI escapes) cannot change
+/// the output under test. Only `PATH` is passed through, for locating external
+/// programs.
 fn skill_curator(sandbox: &Path) -> Command {
     let mut cmd = cargo_bin_cmd!("skill-curator");
+    cmd.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        cmd.env("PATH", path);
+    }
     cmd.current_dir(sandbox)
         .env("HOME", sandbox)
         .env("XDG_CONFIG_HOME", sandbox.join(".config"))
         .env("XDG_STATE_HOME", sandbox.join(".local/state"))
-        .env("XDG_CACHE_HOME", sandbox.join(".cache"))
-        .env_remove("RUST_BACKTRACE");
+        .env("XDG_CACHE_HOME", sandbox.join(".cache"));
     cmd
+}
+
+/// Set in the re-run started by
+/// `cli_contract_holds_when_the_caller_environment_is_hostile`, so the re-run
+/// does not start another one.
+const HOSTILE_RERUN_MARKER: &str = "SKILL_CURATOR_TEST_HOSTILE_RERUN";
+
+/// Runs every test of this binary again with inherited environment variables
+/// that would change the output under test, such as forced colour. The tests
+/// must still pass, which proves `skill_curator` does not leak the caller's
+/// environment into the binary under test.
+#[test]
+fn cli_contract_holds_when_the_caller_environment_is_hostile() -> TestResult {
+    if std::env::var_os(HOSTILE_RERUN_MARKER).is_some() {
+        return Ok(());
+    }
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .env(HOSTILE_RERUN_MARKER, "1")
+        .env("CLICOLOR_FORCE", "1")
+        .env("CLICOLOR", "1")
+        .env("RUST_BACKTRACE", "1")
+        .env("XDG_CONFIG_HOME", "/nonexistent/skill-curator-test-config")
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "CLI tests fail when the caller environment is hostile:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("test help_lists_every_v1_subcommand_and_global_flag ... ok"),
+        "the hostile-environment re-run did not run the CLI tests:\n{stdout}"
+    );
+    Ok(())
 }
 
 /// Names of the entries in the `Commands:` section of `--help` output. A
