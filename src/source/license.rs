@@ -29,9 +29,37 @@ const GNU_LICENSES: &[(&str, &[(&str, &str)])] = &[
         &[("version 3", "GPL-3.0"), ("version 2", "GPL-2.0")],
     ),
 ];
-/// Bytes of normalised text, from its start, in which a GNU license name
-/// counts as the title or the notice naming the license.
-const GNU_NAME_WITHIN: usize = 600;
+/// Licenses identified by their title, each with its accepted wordings:
+/// the full text opens with it and the short notice names it. Elsewhere in
+/// a text the name may only be referred to, as in the "Change License" of a
+/// Business Source License.
+const TITLED_LICENSES: &[(&str, &[&str])] = &[
+    (
+        "Apache-2.0",
+        &["apache license version 2.0", "apache license, version 2.0"],
+    ),
+    (
+        "MPL-2.0",
+        &[
+            "mozilla public license version 2.0",
+            "mozilla public license, version 2.0",
+            "mozilla public license, v. 2.0",
+        ],
+    ),
+];
+/// Bytes of normalised text, from its start, in which a license name counts
+/// as the title or the notice naming the license.
+const TITLE_WITHIN: usize = 600;
+/// Phrases of terms that restrict or replace an open-source license they
+/// name or quote: source-available licenses and added conditions. A text
+/// holding one is never summarised as the license it builds on.
+const RESTRICTED_TERMS: &[&str] = &[
+    "business source license",
+    "change license",
+    "commons clause",
+    "good, not evil",
+    "server side public license",
+];
 /// Bytes after a GNU license name in which its version is looked for, long
 /// enough for "as published by the Free Software Foundation, either".
 const GNU_VERSION_WITHIN: usize = 120;
@@ -60,8 +88,6 @@ const BSD_ADVERTISING: &str =
 /// BSD-2-Clause: a text matching no entry exactly stays unidentified, so the
 /// unclear-license warning fires rather than a wrong summary being recorded.
 const SIGNATURES: &[(&str, &[&str], &[&str])] = &[
-    ("Apache-2.0", &["apache license", "version 2.0"], &[]),
-    ("MPL-2.0", &["mozilla public license", "2.0"], &[]),
     (
         "MIT",
         &[
@@ -130,9 +156,11 @@ const SIGNATURES: &[(&str, &[&str], &[&str])] = &[
 
 /// Identifies the license in `text`: an `SPDX-License-Identifier:` tag when
 /// present, otherwise the GNU license named near the top, otherwise the
-/// first known license whose characteristic phrases all appear and none of
-/// its exclusions. Returns `None` when the license cannot be identified,
-/// including a GNU license named without a known version.
+/// Apache or Mozilla license titled near the top, otherwise the first known
+/// license whose characteristic phrases all appear and none of its
+/// exclusions. Returns `None` when the license cannot be identified,
+/// including a GNU license named without a known version and any text with
+/// restricted terms such as a Business Source License or a Commons Clause.
 #[must_use]
 pub fn identify(text: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(text);
@@ -148,8 +176,23 @@ pub fn identify(text: &[u8]) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase();
+    if RESTRICTED_TERMS
+        .iter()
+        .any(|phrase| normalised.contains(phrase))
+    {
+        return None;
+    }
     if let Some(gnu) = identify_gnu(&normalised) {
         return gnu.map(str::to_owned);
+    }
+    if let Some((id, _)) = TITLED_LICENSES.iter().find(|(_, wordings)| {
+        wordings.iter().any(|wording| {
+            normalised
+                .find(wording)
+                .is_some_and(|start| start < TITLE_WITHIN)
+        })
+    }) {
+        return Some((*id).to_owned());
     }
     SIGNATURES
         .iter()
@@ -167,7 +210,7 @@ fn identify_gnu(normalised: &str) -> Option<Option<&'static str>> {
         .iter()
         .filter_map(|(name, versions)| {
             let start = normalised.find(name)?;
-            (start < GNU_NAME_WITHIN).then_some((start, *name, *versions))
+            (start < TITLE_WITHIN).then_some((start, *name, *versions))
         })
         .min_by_key(|(start, _, _)| *start)?;
     let after = normalised.get(start + name.len()..).unwrap_or_default();

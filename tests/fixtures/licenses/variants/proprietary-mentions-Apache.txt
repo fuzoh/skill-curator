@@ -1,0 +1,18 @@
+Example Corp Proprietary License
+
+Copyright (c) 2026 Example Corp. All rights reserved.
+
+This software and its documentation are the confidential property of Example
+Corp. You may use the software only under a written agreement with Example
+Corp. You may not copy, modify, distribute, sublicense, or sell the software,
+in whole or in part, without the prior written permission of Example Corp.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED. IN NO EVENT SHALL EXAMPLE CORP BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY ARISING FROM THE SOFTWARE OR ITS USE.
+
+Third-party notices
+
+The software bundles a parser originally published under the Apache License,
+Version 2.0, and a font published under the Mozilla Public License, v. 2.0.
+Their notices are listed in the THIRD-PARTY file.

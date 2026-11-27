@@ -246,9 +246,12 @@ Choices made there:
   summary is the file's `SPDX-License-Identifier` tag, else the GNU license
   named first near the top of the text with the version right after it
   (full GNU texts and the MPL-2.0 name other GNU licenses further down),
-  else the first match among characteristic phrases of other common
-  licenses, with exclusions so that a text is never read as a laxer
-  relative (MIT as MIT-0, BSD-3-Clause as BSD-2-Clause), else absent. A
+  else the Apache-2.0 or MPL-2.0 title near the top, else the first match
+  among characteristic phrases of other common licenses, with exclusions
+  so that a text is never read as a laxer relative (MIT as MIT-0,
+  BSD-3-Clause as BSD-2-Clause), else absent. A text with restricted terms
+  (Business Source License, Commons Clause, "Good, not Evil", Server Side
+  Public License) is never summarised as the license it names or quotes. A
   near miss stays unidentified rather than getting a wrong summary.
   Regression tests run on full canonical texts. The warning fires when no
   file is found or any found file is unidentified.
