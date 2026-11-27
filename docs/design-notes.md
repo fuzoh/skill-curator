@@ -138,3 +138,32 @@ future implementation-spec breakdown must carry them into a bootstrap issue.
 Supporting tooling evidence lives in
 [Rust quality tooling: tests, mutation, duplication, and lint](https://github.com/fuzoh/skill-curator/issues/28).
 No Rust setup has been implemented.
+
+### Collection file formats
+
+Implemented in
+[Manifest, lock, and machine config schemas and Collection loader](https://github.com/fuzoh/skill-curator/issues/30);
+the Rust types in `src/collection/` are the reference. Choices made there:
+
+- Names of Sources, Skills, presets, Composition inputs, and Destinations are
+  single safe path components: a lowercase letter or digit, then up to 63
+  characters from `a-z`, `0-9`, `-`, `_`.
+- D1 rules are written `frontmatter = { set, remove, keep_only }` and D2 rules
+  `files = { exclude, include }`. Presets hold either or both and are
+  referenced by Adapt Skills in order through `presets = [...]`.
+- A Source may name a `branch` to follow; the pinned Revision lives only in
+  `lock.toml`, as a full commit identifier.
+- `mode = "copy" | "adapt" | "composition" | "local"` selects the Skill
+  shape. A Composition needs at least two inputs and an `intent` file under
+  `intents/`; intents and Fragments are paths from the Collection root, inside
+  `intents/` and `fragments/`.
+- Each Destination declares `harness`, an optional `skills_dir` (defaulting
+  per harness, required for `generic`), `enabled` (default true), optional
+  `instructions = { file, fragments }`, and install-time `frontmatter` rules.
+  `machine.toml` can change `enabled`, `skills_dir`, and `instruction_file`
+  for declared Destinations only.
+- `lock.toml` starts with `format = 1` and records per Skill `output_hash`,
+  `inputs_hash`, and `provenance` entries (Source, URL, `upstream_path`,
+  Revision, license files). Hashes are `sha256:` digests over a
+  length-prefixed encoding, independent of TOML formatting and file creation
+  order.
