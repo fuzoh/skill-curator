@@ -226,6 +226,17 @@ fn skill_md(version: &str) -> String {
     format!("---\nname: grill-me\ndescription: Grill the user.\n---\nVersion {version}\n")
 }
 
+/// The path and problem of every entry an `UnsafeSkill` error refused.
+fn refused_entries(err: &SourceError) -> Result<Vec<(&str, EntryProblem)>, Box<dyn Error>> {
+    let SourceError::UnsafeSkill { entries, .. } = err else {
+        return Err(format!("expected UnsafeSkill, got {err:?}").into());
+    };
+    Ok(entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry.problem.clone()))
+        .collect())
+}
+
 /// Every file below `dir`, relative and sorted.
 fn files(dir: &Path) -> Result<Vec<String>, Box<dyn Error>> {
     let mut found = Vec::new();
@@ -690,15 +701,8 @@ fn symbolic_links_in_a_skill_are_refused() -> TestResult {
         )
         .err()
         .ok_or("symbolic links must be refused")?;
-    let SourceError::UnsafeSkill { entries, .. } = &err else {
-        return Err(format!("expected UnsafeSkill, got {err:?}").into());
-    };
-    let refused = entries
-        .iter()
-        .map(|entry| (entry.path.as_str(), entry.problem.clone()))
-        .collect::<Vec<_>>();
     assert_eq!(
-        refused,
+        refused_entries(&err)?,
         [
             (
                 "absolute",
@@ -768,15 +772,8 @@ fn traversal_and_git_metadata_entries_are_refused() -> TestResult {
         .extract(&source_name, &source, &revision, &path("skills/hostile")?)
         .err()
         .ok_or("hostile paths must be refused")?;
-    let SourceError::UnsafeSkill { entries, .. } = &err else {
-        return Err(format!("expected UnsafeSkill, got {err:?}").into());
-    };
-    let refused = entries
-        .iter()
-        .map(|entry| (entry.path.as_str(), entry.problem.clone()))
-        .collect::<Vec<_>>();
     assert_eq!(
-        refused,
+        refused_entries(&err)?,
         [
             ("..", EntryProblem::InvalidPath(PathError::Traversal)),
             (".git/config", EntryProblem::InvalidPath(PathError::GitDir)),

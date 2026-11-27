@@ -33,7 +33,7 @@ use crate::safety::{HomeDir, Name, RelativePath};
 pub use git::Git;
 pub use license::{LicenseWarning, LicenseWarningKind, identify as identify_license};
 pub use tree::{EntryProblem, NotFoundReason, RejectedEntry};
-use tree::{Refusal, Selection};
+use tree::{Refusal, Refused, Selection};
 
 /// Directory of the tool's cache below the user's cache directory.
 const CACHE_DIR_NAME: &str = "skill-curator";
@@ -397,30 +397,11 @@ impl SourceCache {
                 });
             }
             Selection::Unsafe(refused) => {
-                let mut rejected = Vec::with_capacity(refused.len());
-                for entry in refused {
-                    let problem = match entry.kind {
-                        Refusal::Symlink { oid } => {
-                            let target =
-                                String::from_utf8_lossy(&self.read_blob(&repository, oid)?)
-                                    .into_owned();
-                            EntryProblem::Symlink {
-                                escapes: tree::link_escapes(&entry.path, &target),
-                                target,
-                            }
-                        }
-                        Refusal::Other(problem) => problem,
-                    };
-                    rejected.push(RejectedEntry {
-                        path: entry.path,
-                        problem,
-                    });
-                }
                 return Err(SourceError::UnsafeSkill {
                     source_name: name.clone(),
                     revision: revision.clone(),
                     upstream_path: upstream_path.clone(),
-                    entries: rejected,
+                    entries: self.describe_refused(&repository, refused)?,
                 });
             }
         };
@@ -437,14 +418,15 @@ impl SourceCache {
                 .collect::<Vec<_>>(),
         )?;
 
-        let mut licenses = Vec::new();
-        for (path, oid) in tree::license_files(&entries, upstream_path) {
-            let text = self.read_blob(&repository, oid)?;
-            licenses.push(LicenseFile {
-                path,
-                summary: license::identify(&text),
-            });
-        }
+        let licenses = tree::license_files(&entries, upstream_path)
+            .into_iter()
+            .map(|(path, oid)| {
+                Ok(LicenseFile {
+                    path,
+                    summary: license::identify(&self.read_blob(&repository, oid)?),
+                })
+            })
+            .collect::<Result<Vec<_>, SourceError>>()?;
 
         Ok(ExtractedSkill {
             dir,
@@ -597,6 +579,34 @@ impl SourceCache {
             Err(SourceError::Git { .. }) => Ok(false),
             Err(err) => Err(err),
         }
+    }
+
+    /// Describes each refused entry, reading the target of symbolic links.
+    fn describe_refused(
+        &self,
+        repository: &Path,
+        refused: Vec<Refused<'_>>,
+    ) -> Result<Vec<RejectedEntry>, SourceError> {
+        refused
+            .into_iter()
+            .map(|entry| {
+                let problem = match entry.kind {
+                    Refusal::Symlink { oid } => {
+                        let target =
+                            String::from_utf8_lossy(&self.read_blob(repository, oid)?).into_owned();
+                        EntryProblem::Symlink {
+                            escapes: tree::link_escapes(&entry.path, &target),
+                            target,
+                        }
+                    }
+                    Refusal::Other(problem) => problem,
+                };
+                Ok(RejectedEntry {
+                    path: entry.path,
+                    problem,
+                })
+            })
+            .collect()
     }
 
     fn read_blob(&self, repository: &Path, oid: &str) -> Result<Vec<u8>, SourceError> {

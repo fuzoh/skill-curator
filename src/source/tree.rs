@@ -246,35 +246,27 @@ pub(crate) fn select_skill<'a>(
     let mut files = Vec::new();
     let mut refused = Vec::new();
     for (entry, rel) in inside {
-        let display = String::from_utf8_lossy(rel).into_owned();
-        let refuse = |kind| Refused {
-            path: display.clone(),
+        let kind = match std::str::from_utf8(rel).map(RelativePath::exact) {
+            Err(_) => Refusal::Other(EntryProblem::NonUtf8Path),
+            Ok(Err(reason)) => Refusal::Other(EntryProblem::InvalidPath(reason)),
+            Ok(Ok(path)) => match &entry.mode {
+                Mode::File | Mode::Executable => {
+                    files.push(SkillFile {
+                        path,
+                        executable: entry.mode == Mode::Executable,
+                        oid: &entry.oid,
+                    });
+                    continue;
+                }
+                Mode::Symlink => Refusal::Symlink { oid: &entry.oid },
+                Mode::Submodule => Refusal::Other(EntryProblem::Submodule),
+                Mode::Other(mode) => Refusal::Other(EntryProblem::UnsupportedMode(mode.clone())),
+            },
+        };
+        refused.push(Refused {
+            path: String::from_utf8_lossy(rel).into_owned(),
             kind,
-        };
-        let path = match std::str::from_utf8(rel) {
-            Ok(text) => RelativePath::exact(text),
-            Err(_) => {
-                refused.push(refuse(Refusal::Other(EntryProblem::NonUtf8Path)));
-                continue;
-            }
-        };
-        match (path, &entry.mode) {
-            (Err(reason), _) => {
-                refused.push(refuse(Refusal::Other(EntryProblem::InvalidPath(reason))));
-            }
-            (Ok(_), Mode::Symlink) => refused.push(refuse(Refusal::Symlink { oid: &entry.oid })),
-            (Ok(_), Mode::Submodule) => {
-                refused.push(refuse(Refusal::Other(EntryProblem::Submodule)))
-            }
-            (Ok(_), Mode::Other(mode)) => refused.push(refuse(Refusal::Other(
-                EntryProblem::UnsupportedMode(mode.clone()),
-            ))),
-            (Ok(path), Mode::File | Mode::Executable) => files.push(SkillFile {
-                path,
-                executable: entry.mode == Mode::Executable,
-                oid: &entry.oid,
-            }),
-        }
+        });
     }
     if refused.is_empty() {
         files.sort_by(|a, b| a.path.cmp(&b.path));
