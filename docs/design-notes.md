@@ -138,3 +138,53 @@ future implementation-spec breakdown must carry them into a bootstrap issue.
 Supporting tooling evidence lives in
 [Rust quality tooling: tests, mutation, duplication, and lint](https://github.com/fuzoh/skill-curator/issues/28).
 No Rust setup has been implemented.
+
+### Collection file formats
+
+Implemented in
+[Manifest, lock, and machine config schemas and Collection loader](https://github.com/fuzoh/skill-curator/issues/30);
+the Rust types in `src/collection/` are the reference. Choices made there:
+
+- Names of Sources, Skills, presets, Composition inputs, and Destinations are
+  single safe path components: a lowercase letter or digit, then up to 63
+  characters from `a-z`, `0-9`, `-`, `_`.
+- D1 rules are written `frontmatter = { set, remove, keep_only }` and D2 rules
+  `files = { exclude, include }`. A key may not be both set and removed, nor
+  set while missing from `keep_only`. Presets hold either or both and are
+  referenced by Adapt Skills in order through `presets = [...]`, each preset
+  at most once. Presets are global: the issue's "presets per Source or group"
+  is met by referencing a preset from each Skill that needs it, not by
+  attaching it to a Source. Compositions and Destinations write their rules
+  inline.
+- A Source may name a `branch` to follow: a plain branch name under the
+  `git check-ref-format` rules, never a refspec or revision expression. The
+  pinned Revision lives only in `lock.toml`, as a full commit identifier.
+- `mode = "copy" | "adapt" | "composition" | "local"` selects the Skill
+  shape. A Composition needs at least two inputs naming different upstream
+  Skills (Source and `upstream_path`) and an `intent` file under `intents/`.
+  `intents/<skill>.md` is the suggested name, not a requirement. Intents and
+  Fragments are paths from the Collection root, inside `intents/` and
+  `fragments/`, and must be regular files reached without symbolic links; a
+  Destination lists each Fragment at most once.
+- Each Destination declares `harness`, an optional `skills_dir` (defaulting
+  per harness, required for `generic`), `enabled` (default true), optional
+  `instructions = { file, fragments }`, and install-time `frontmatter` rules.
+  `machine.toml` can change `enabled`, `skills_dir`, and `instruction_file`
+  for declared Destinations only. Installation paths are never `/` or `~`
+  alone, nor the home directory or one of its parents once expanded, and
+  never the Collection root, a path inside it, or one containing it
+  (compared with the root both as given and with symbolic links resolved).
+  Several
+  Destinations may name the same paths in the Manifest; on each machine, the
+  Skills directories and instruction files of enabled Destinations must be
+  distinct and none may lie inside another.
+- `lock.toml` starts with `format = 1` and records per Skill `output_hash`,
+  `inputs_hash`, and `provenance` entries (Source, URL, `upstream_path`,
+  Revision, license files), one per Composition input. `format` is read
+  first, so a lock from a newer release asks for an upgrade instead of
+  failing on its schema. Hashes are `sha256:` digests over a length-prefixed
+  encoding, independent of TOML formatting and file creation order.
+- `inputs_hash` covers the Skill's declaration as written, the contents of
+  its presets in order (not their names), and its intent bytes. It does not
+  merge rules into their effective result, so renaming a preset keeps the
+  hash, while moving a rule between a preset and the Skill changes it.

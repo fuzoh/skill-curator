@@ -11,9 +11,15 @@
 # credentials: a mutated deletion path can escape its temporary directory.
 # See CONTRIBUTING.md.
 examine_globs = [
-    # Path validation and overwrite protection.
+    # Path validation (symlinks, path traversal) and overwrite protection.
     "src/safety.rs",
     "src/safety/**/*.rs",
+    # Symlink and special-file refusal while hashing a Skill directory.
+    "src/hash.rs",
+    # Symlink checks on Collection files and Destination path checks (home
+    # directory, Collection root, enabled Destinations inside one another).
+    "src/collection.rs",
+    "src/collection/machine.rs",
     # Revision selection.
     "src/revision.rs",
     "src/revision/**/*.rs",
