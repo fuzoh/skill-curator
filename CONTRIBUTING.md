@@ -3,7 +3,10 @@
 ## Toolchain
 
 `rust-toolchain.toml` pins the Rust release used for every check. With
-rustup, `cargo` selects it automatically inside this repository. Bump it
+rustup, `cargo` selects it automatically inside this repository. Without
+rustup (for example a distribution package), install that exact release:
+`scripts/check.sh` refuses to run when `rustc` or `cargo` reports another
+release, because rustfmt and Clippy findings differ between releases. Bump it
 deliberately in its own commit and fix any new rustfmt or Clippy findings in
 that commit.
 

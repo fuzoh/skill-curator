@@ -156,6 +156,95 @@ fn ci_runs_the_local_check_entrypoint() -> TestResult {
     Ok(())
 }
 
+/// Stand-ins for `rustc` and `cargo`: `--version` reports `$FAKE_RUST_VERSION`,
+/// any other `cargo` invocation is appended to `$FAKE_CARGO_LOG`.
+#[cfg(unix)]
+fn fake_rust_toolchain(bin: &Path) -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scripts = [
+        (
+            "rustc",
+            "#!/bin/sh\necho \"rustc $FAKE_RUST_VERSION (fake 2000-01-01)\"\n",
+        ),
+        (
+            "cargo",
+            "#!/bin/sh\n\
+             if [ \"$1\" = --version ]; then\n  \
+               echo \"cargo $FAKE_RUST_VERSION (fake 2000-01-01)\"\n\
+             else\n  \
+               echo \"$*\" >> \"$FAKE_CARGO_LOG\"\n\
+             fi\n",
+        ),
+    ];
+    for (name, body) in scripts {
+        let path = bin.join(name);
+        fs::write(&path, body)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+/// Runs `scripts/check.sh` with fake `rustc` and `cargo` reporting `version`,
+/// returning the command and the path of the cargo invocation log.
+#[cfg(unix)]
+fn check_script_with_rust(
+    sandbox: &Path,
+    version: &str,
+) -> Result<(assert_cmd::Command, std::path::PathBuf), Box<dyn Error>> {
+    let bin = sandbox.join("bin");
+    fs::create_dir(&bin)?;
+    fake_rust_toolchain(&bin)?;
+    let log = sandbox.join("cargo.log");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))?;
+
+    let mut cmd = assert_cmd::Command::new("bash");
+    cmd.arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check.sh"))
+        .env("PATH", path)
+        .env("HOME", sandbox)
+        .env("FAKE_RUST_VERSION", version)
+        .env("FAKE_CARGO_LOG", &log);
+    Ok((cmd, log))
+}
+
+#[cfg(unix)]
+#[test]
+fn check_script_refuses_a_toolchain_other_than_the_pinned_one() -> TestResult {
+    let toolchain = repo_toml("rust-toolchain.toml")?;
+    let pinned = lookup_str(&toolchain, "toolchain.channel").ok_or("missing channel")?;
+    let sandbox = tempfile::TempDir::new()?;
+    let (mut cmd, log) = check_script_with_rust(sandbox.path(), "0.0.1")?;
+
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains(format!(
+            "rust-toolchain.toml pins Rust {pinned} but `rustc --version` reports 0.0.1"
+        )));
+    assert!(!log.exists(), "no check may run on an unpinned toolchain");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn check_script_runs_every_blocking_check_on_the_pinned_toolchain() -> TestResult {
+    let toolchain = repo_toml("rust-toolchain.toml")?;
+    let pinned = lookup_str(&toolchain, "toolchain.channel").ok_or("missing channel")?;
+    let sandbox = tempfile::TempDir::new()?;
+    let (mut cmd, log) = check_script_with_rust(sandbox.path(), pinned)?;
+
+    cmd.assert().success();
+    assert_eq!(
+        fs::read_to_string(log)?,
+        "fmt --all --check\n\
+         clippy --all-targets --all-features --locked -- -D warnings\n\
+         test --all-features --locked\n\
+         deny check\n"
+    );
+    Ok(())
+}
+
 #[test]
 fn consultative_checks_never_gate_pushes_or_pull_requests() -> TestResult {
     let workflow = repo_file(".github/workflows/consultative.yml")?;
