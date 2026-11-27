@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::hash::{self, Digest, HashError};
-use crate::safety::Name;
+use crate::safety::{HomeDir, Name, RelativePath};
 use lock::{LOCK_FORMAT, Lock};
 use machine::{MachineConfig, ResolvedDestination};
 use manifest::{FRAGMENTS_DIR, INTENTS_DIR, Manifest, Preset, Skill};
@@ -174,8 +174,9 @@ impl Collection {
     /// Returns a [`CollectionError`] when a file cannot be read or parsed, or
     /// listing every validation problem: undefined Sources or presets,
     /// Compositions without a written intent, intents or Fragments that are
-    /// missing or outside their directories, local Skills without
-    /// `skills/<name>/SKILL.md`, or an unsupported lock format.
+    /// missing, outside their directories, or reached through a symbolic
+    /// link, local Skills without a regular `skills/<name>/SKILL.md`, or an
+    /// unsupported lock format.
     pub fn load(root: &Path) -> Result<Self, CollectionError> {
         let manifest_path = root.join(MANIFEST_FILE);
         let text = fs::read_to_string(&manifest_path).map_err(|source| CollectionError::Read {
@@ -185,7 +186,7 @@ impl Collection {
         let manifest = parse(&manifest_path, &text, Manifest::from_toml)?;
 
         let mut problems = manifest.problems();
-        problems.extend(missing_files(root, &manifest));
+        problems.extend(missing_files(root, &manifest)?);
         if !problems.is_empty() {
             return Err(CollectionError::Invalid {
                 path: manifest_path,
@@ -193,24 +194,7 @@ impl Collection {
             });
         }
 
-        let lock_path = root.join(LOCK_FILE);
-        let lock = match read_optional(&lock_path)? {
-            Some(text) => parse(&lock_path, &text, Lock::from_toml)?,
-            None => Lock::default(),
-        };
-        if lock.format != LOCK_FORMAT {
-            return Err(CollectionError::Invalid {
-                path: lock_path,
-                problems: vec![Problem::new(
-                    "format",
-                    format!(
-                        "lock format {} is not supported by this release, which reads format {LOCK_FORMAT}; upgrade skill-curator",
-                        lock.format
-                    ),
-                )],
-            });
-        }
-
+        let lock = load_lock(&root.join(LOCK_FILE))?;
         Ok(Self {
             root: root.to_path_buf(),
             manifest,
@@ -245,7 +229,8 @@ impl Collection {
     /// The Manifest's Destinations as they apply on this machine.
     ///
     /// `machine_config` is the path of `machine.toml`; a missing file means
-    /// no machine-local settings. `home` replaces a leading `~` in paths.
+    /// no machine-local settings. `home` replaces a leading `~` in paths, so
+    /// every resolved path is absolute.
     ///
     /// # Errors
     ///
@@ -255,7 +240,7 @@ impl Collection {
     pub fn destinations(
         &self,
         machine_config: &Path,
-        home: &Path,
+        home: &HomeDir,
     ) -> Result<Vec<ResolvedDestination>, CollectionError> {
         let machine = match read_optional(machine_config)? {
             Some(text) => parse(machine_config, &text, MachineConfig::from_toml)?,
@@ -273,53 +258,66 @@ impl Collection {
     ///
     /// # Errors
     ///
-    /// Returns a [`CollectionError`] when the directory cannot be read or
-    /// holds a symbolic link, special file, or non-UTF-8 name.
+    /// Returns a [`CollectionError`] when the directory cannot be read, is
+    /// reached through a symbolic link, or holds a symbolic link, special
+    /// file, or non-UTF-8 name.
     pub fn output_digest(&self, name: &Name) -> Result<Digest, CollectionError> {
-        Ok(hash::tree_digest(&self.skill_dir(name))?)
+        let dir = self.skill_dir(name);
+        if let Entry::Symlink(link) = inspect(&self.root, &[SKILLS_DIR, name.as_str()])? {
+            return Err(HashError::Symlink { path: link }.into());
+        }
+        Ok(hash::tree_digest(&dir)?)
     }
 
-    /// Hash of the normalised inputs of Skill `name`: its declaration, the
-    /// presets it references (in order), and the bytes of its written intent.
-    /// Returns `None` for local Skills, which have no inputs.
+    /// Hash of the normalised inputs of Skill `name`: its declaration as
+    /// written, the contents of the presets it references (in order, not
+    /// their names), and the bytes of its written intent. Returns `None` for
+    /// local Skills, which have no inputs.
     ///
     /// # Errors
     ///
     /// Returns a [`CollectionError`] when the Skill is not declared or its
-    /// intent cannot be read.
+    /// intent cannot be read as a regular file of the Collection.
     pub fn inputs_digest(&self, name: &Name) -> Result<Option<Digest>, CollectionError> {
         let skill = self
             .manifest
             .skills
             .get(name)
             .ok_or_else(|| CollectionError::UnknownSkill { name: name.clone() })?;
-        if matches!(skill, Skill::Local(_)) {
-            return Ok(None);
-        }
+        let manifest_path = || self.root.join(MANIFEST_FILE);
         let presets = match skill {
+            Skill::Local(_) => return Ok(None),
             Skill::Adapt(adapt) => adapt
                 .presets
                 .iter()
-                .filter_map(|preset| {
-                    self.manifest
-                        .presets
-                        .get(preset)
-                        .map(|rules| (preset, rules))
-                })
+                .filter_map(|preset| self.manifest.presets.get(preset))
                 .collect(),
-            Skill::Copy(_) | Skill::Composition(_) | Skill::Local(_) => Vec::new(),
+            Skill::Copy(_) | Skill::Composition(_) => Vec::new(),
         };
-        let declaration = toml::Value::try_from(Inputs { skill, presets }).map_err(|err| {
+        let mut declaration = toml::Value::try_from(Inputs { skill, presets }).map_err(|err| {
             CollectionError::Invalid {
-                path: self.root.join(MANIFEST_FILE),
+                path: manifest_path(),
                 problems: vec![Problem::new(
                     format!("skills.{name}"),
                     format!("cannot normalise the declaration: {err}"),
                 )],
             }
         })?;
+        // Preset names are labels: renaming a preset changes no rule.
+        if let Some(toml::Value::Table(declared)) = declaration.get_mut("skill") {
+            declared.remove("presets");
+        }
         let intent = match skill.intent() {
             Some(intent) => {
+                let location = format!("skills.{name}.intent");
+                if let Some(problem) =
+                    regular_file_problem(&self.root, intent, &location, "written intent")?
+                {
+                    return Err(CollectionError::Invalid {
+                        path: manifest_path(),
+                        problems: vec![problem],
+                    });
+                }
                 let path = intent.join_to(&self.root);
                 Some(fs::read(&path).map_err(|source| CollectionError::Read { path, source })?)
             }
@@ -333,33 +331,141 @@ impl Collection {
 #[derive(Serialize)]
 struct Inputs<'a> {
     skill: &'a Skill,
-    presets: Vec<(&'a Name, &'a Preset)>,
+    presets: Vec<&'a Preset>,
 }
 
-/// Files the Manifest references that must exist in the Collection: written
-/// intents, Fragments, and the `SKILL.md` of local Skills.
-fn missing_files(root: &Path, manifest: &Manifest) -> Vec<Problem> {
+/// Reads `lock.toml`, or returns an empty lock when the file is absent.
+///
+/// The declared format is checked before the rest of the file, so a lock
+/// written by a newer release is reported as such rather than as a schema
+/// error.
+fn load_lock(path: &Path) -> Result<Lock, CollectionError> {
+    let Some(text) = read_optional(path)? else {
+        return Ok(Lock::default());
+    };
+    if let Some(format) = Lock::declared_format(&text)
+        && format != LOCK_FORMAT
+    {
+        return Err(CollectionError::Invalid {
+            path: path.to_path_buf(),
+            problems: vec![Problem::new(
+                "format",
+                format!(
+                    "lock format {format} is not supported by this release, which reads format {LOCK_FORMAT}; upgrade skill-curator"
+                ),
+            )],
+        });
+    }
+    let lock = parse(path, &text, Lock::from_toml)?;
+    let problems = lock.problems();
+    if problems.is_empty() {
+        Ok(lock)
+    } else {
+        Err(CollectionError::Invalid {
+            path: path.to_path_buf(),
+            problems,
+        })
+    }
+}
+
+/// What a path inside the Collection names, found without following
+/// symbolic links below the Collection root.
+enum Entry {
+    /// Nothing exists at the path.
+    Missing,
+    /// The path, or one of its parent directories below the root, is a
+    /// symbolic link, given by its full path.
+    Symlink(PathBuf),
+    /// A regular file.
+    File,
+    /// A directory.
+    Dir,
+    /// Another kind of entry.
+    Other,
+}
+
+/// Walks `segments` down from `root`, checking each component with
+/// `symlink_metadata`, so that no link inside the Collection is followed.
+fn inspect(root: &Path, segments: &[&str]) -> Result<Entry, CollectionError> {
+    let mut path = root.to_path_buf();
+    let mut entry = Entry::Dir;
+    for segment in segments {
+        if !matches!(entry, Entry::Dir) {
+            return Ok(Entry::Missing);
+        }
+        path.push(segment);
+        let file_type = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata.file_type(),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Entry::Missing),
+            Err(source) => return Err(CollectionError::Read { path, source }),
+        };
+        entry = if file_type.is_symlink() {
+            return Ok(Entry::Symlink(path));
+        } else if file_type.is_dir() {
+            Entry::Dir
+        } else if file_type.is_file() {
+            Entry::File
+        } else {
+            Entry::Other
+        };
+    }
+    Ok(entry)
+}
+
+/// Problem with `relative`, the Collection file the Manifest names at
+/// `location`, unless it is a regular file reached without symbolic links.
+fn regular_file_problem(
+    root: &Path,
+    relative: &RelativePath,
+    location: &str,
+    what: &str,
+) -> Result<Option<Problem>, CollectionError> {
+    let segments = relative.as_str().split('/').collect::<Vec<_>>();
+    let message = match inspect(root, &segments)? {
+        Entry::File => return Ok(None),
+        Entry::Missing => {
+            format!("{what} `{relative}` does not exist; create it in the Collection")
+        }
+        Entry::Symlink(link) => format!(
+            "{what} `{relative}` is reached through the symbolic link {}; replace it with a regular file in the Collection",
+            link.display()
+        ),
+        Entry::Dir | Entry::Other => format!("{what} `{relative}` is not a regular file"),
+    };
+    Ok(Some(Problem::new(location, message)))
+}
+
+/// Files the Manifest references that must be regular files of the
+/// Collection: written intents, Fragments, and the `SKILL.md` of local
+/// Skills.
+fn missing_files(root: &Path, manifest: &Manifest) -> Result<Vec<Problem>, CollectionError> {
     let mut problems = Vec::new();
     for (name, skill) in &manifest.skills {
         // Paths outside their directory are already reported by
         // `Manifest::problems`.
         if let Some(intent) = skill.intent()
             && intent.starts_with_dir(INTENTS_DIR)
-            && !intent.join_to(root).is_file()
         {
-            problems.push(Problem::new(
-                format!("skills.{name}.intent"),
-                format!("written intent `{intent}` does not exist; create it in the Collection"),
-            ));
+            problems.extend(regular_file_problem(
+                root,
+                intent,
+                &format!("skills.{name}.intent"),
+                "written intent",
+            )?);
         }
         if matches!(skill, Skill::Local(_)) {
             let skill_file = format!("{SKILLS_DIR}/{name}/{SKILL_FILE}");
-            if !root.join(&skill_file).is_file() {
-                problems.push(Problem::new(
-                    format!("skills.{name}"),
-                    format!("local Skill has no `{skill_file}`; author it in the Collection"),
-                ));
-            }
+            let message = match inspect(root, &[SKILLS_DIR, name.as_str(), SKILL_FILE])? {
+                Entry::File => continue,
+                Entry::Missing | Entry::Dir | Entry::Other => {
+                    format!("local Skill has no `{skill_file}`; author it in the Collection")
+                }
+                Entry::Symlink(link) => format!(
+                    "local Skill `{skill_file}` is reached through the symbolic link {}; keep the Skill as regular files in the Collection",
+                    link.display()
+                ),
+            };
+            problems.push(Problem::new(format!("skills.{name}"), message));
         }
     }
     for (name, destination) in &manifest.destinations {
@@ -367,13 +473,15 @@ fn missing_files(root: &Path, manifest: &Manifest) -> Vec<Problem> {
             continue;
         };
         for fragment in &instructions.fragments {
-            if fragment.starts_with_dir(FRAGMENTS_DIR) && !fragment.join_to(root).is_file() {
-                problems.push(Problem::new(
-                    format!("destinations.{name}.instructions.fragments"),
-                    format!("Fragment `{fragment}` does not exist; create it in the Collection"),
-                ));
+            if fragment.starts_with_dir(FRAGMENTS_DIR) {
+                problems.extend(regular_file_problem(
+                    root,
+                    fragment,
+                    &format!("destinations.{name}.instructions.fragments"),
+                    "Fragment",
+                )?);
             }
         }
     }
-    problems
+    Ok(problems)
 }

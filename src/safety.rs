@@ -6,7 +6,7 @@
 //! re-checking for path traversal.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +31,11 @@ pub enum PathError {
     /// An installation path is neither absolute nor relative to the home
     /// directory (`~/`).
     NotAnchored,
+    /// An installation path names the filesystem root or the home directory
+    /// itself, where managed files would mix with unrelated ones.
+    RootOrHome,
+    /// A directory that must be absolute is relative.
+    NotAbsolute,
     /// A name contains characters outside `a-z`, `0-9`, `-`, and `_`, or does
     /// not start with a letter or digit.
     InvalidName,
@@ -47,6 +52,10 @@ impl fmt::Display for PathError {
             Self::Traversal => "it must not contain a `..` component",
             Self::Backslash => "it must use `/` as separator, not `\\`",
             Self::NotAnchored => "it must be absolute or start with `~/`",
+            Self::RootOrHome => {
+                "it must name a path below `/` or `~/`, not the filesystem root or the home directory itself"
+            }
+            Self::NotAbsolute => "it must be an absolute path",
             Self::InvalidName => {
                 "it must start with a lowercase letter or digit and contain only `a-z`, `0-9`, `-`, and `_`"
             }
@@ -318,7 +327,9 @@ impl fmt::Display for PathPattern {
 /// relative to the home directory (`~/.claude/skills`).
 ///
 /// It never contains `..`, so a Destination cannot be redirected through a
-/// parent directory. Normalised like [`RelativePath`].
+/// parent directory, and it is never `/` or `~` alone, so a Destination
+/// cannot claim the filesystem root or the whole home directory. Normalised
+/// like [`RelativePath`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct InstallPath(String);
@@ -329,8 +340,8 @@ impl InstallPath {
     /// # Errors
     ///
     /// Returns a [`PathError`] when `raw` is empty, neither absolute nor
-    /// `~/`-relative, or contains a `..` component, a backslash, or a control
-    /// character.
+    /// `~/`-relative, names `/` or `~` itself, or contains a `..` component,
+    /// a backslash, or a control character.
     pub fn new(raw: &str) -> Result<Self, PathError> {
         check_common(raw)?;
         let (anchor, rest) = if let Some(rest) = raw.strip_prefix("~/") {
@@ -348,6 +359,9 @@ impl InstallPath {
         } else {
             relative_segments(rest)?
         };
+        if segments.is_empty() {
+            return Err(PathError::RootOrHome);
+        }
         Ok(Self(format!("{anchor}{}", segments.join("/"))))
     }
 
@@ -357,12 +371,12 @@ impl InstallPath {
         &self.0
     }
 
-    /// The path with a leading `~` replaced by `home`.
+    /// The path with a leading `~` replaced by `home`. The result is always
+    /// absolute.
     #[must_use]
-    pub fn expand(&self, home: &Path) -> PathBuf {
+    pub fn expand(&self, home: &HomeDir) -> PathBuf {
         match self.0.strip_prefix("~/") {
-            Some("") => home.to_path_buf(),
-            Some(rest) => home.join(rest),
+            Some(rest) => home.as_path().join(rest),
             None => PathBuf::from(&self.0),
         }
     }
@@ -385,6 +399,41 @@ impl From<InstallPath> for String {
 impl fmt::Display for InstallPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// The home directory that a leading `~` in an [`InstallPath`] stands for.
+///
+/// It is absolute and has no `..` component, so every expanded installation
+/// path is absolute too and never resolves against the working directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HomeDir(PathBuf);
+
+impl HomeDir {
+    /// Validates `path` as a home directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PathError`] when `path` is empty, relative, or contains a
+    /// `..` component.
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, PathError> {
+        let path = path.into();
+        if path.as_os_str().is_empty() {
+            return Err(PathError::Empty);
+        }
+        if !path.is_absolute() {
+            return Err(PathError::NotAbsolute);
+        }
+        if path.components().any(|c| c == Component::ParentDir) {
+            return Err(PathError::Traversal);
+        }
+        Ok(Self(path))
+    }
+
+    /// The home directory.
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        &self.0
     }
 }
 
@@ -509,10 +558,8 @@ mod tests {
         let cases = [
             ("~/.claude/skills", "~/.claude/skills"),
             ("~/.claude//skills/", "~/.claude/skills"),
-            ("~", "~/"),
             ("/opt/skills", "/opt/skills"),
             ("//opt/./skills", "/opt/skills"),
-            ("/", "/"),
         ];
         for (raw, expected) in cases {
             assert_eq!(InstallPath::new(raw).unwrap().as_str(), expected, "{raw:?}");
@@ -530,6 +577,11 @@ mod tests {
             ("/opt/../etc", PathError::Traversal),
             ("~/a\\b", PathError::Backslash),
             ("/a\0", PathError::ControlCharacter),
+            ("/", PathError::RootOrHome),
+            ("//./", PathError::RootOrHome),
+            ("~", PathError::RootOrHome),
+            ("~/", PathError::RootOrHome),
+            ("~/./", PathError::RootOrHome),
         ];
         for (raw, expected) in cases {
             assert_eq!(InstallPath::new(raw), Err(expected), "{raw:?}");
@@ -538,17 +590,34 @@ mod tests {
 
     #[test]
     fn install_paths_expand_the_home_directory_only() {
-        let home = Path::new("/home/user");
+        let home = HomeDir::new("/home/user").unwrap();
         let cases = [
             ("~/.claude/skills", "/home/user/.claude/skills"),
-            ("~", "/home/user"),
+            ("~/.claude/CLAUDE.md", "/home/user/.claude/CLAUDE.md"),
             ("/opt/skills", "/opt/skills"),
         ];
         for (raw, expected) in cases {
             assert_eq!(
-                InstallPath::new(raw).unwrap().expand(home),
+                InstallPath::new(raw).unwrap().expand(&home),
                 Path::new(expected)
             );
+        }
+    }
+
+    #[test]
+    fn home_directories_are_absolute() {
+        assert_eq!(
+            HomeDir::new("/home/user").unwrap().as_path(),
+            Path::new("/home/user")
+        );
+        let cases = [
+            ("", PathError::Empty),
+            ("home/user", PathError::NotAbsolute),
+            ("~", PathError::NotAbsolute),
+            ("/home/../etc", PathError::Traversal),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(HomeDir::new(raw), Err(expected), "{raw:?}");
         }
     }
 

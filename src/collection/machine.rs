@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Problem;
 use super::manifest::{FrontmatterRules, Harness, Manifest};
-use crate::safety::{InstallPath, Name, RelativePath};
+use crate::safety::{HomeDir, InstallPath, Name, RelativePath};
 
 /// Parsed `machine.toml`. An absent file is the default: every Destination
 /// keeps its portable settings.
@@ -92,12 +92,13 @@ impl MachineConfig {
     ///
     /// Returns the problems found: settings for a Destination the Manifest
     /// does not declare, an instruction file for a Destination without
-    /// instructions, a missing Skills directory, or enabled Destinations that
-    /// would write to the same directory or instruction file.
+    /// instructions, a missing Skills directory, a path that is the home
+    /// directory or one of its parents, or enabled Destinations whose Skills
+    /// directories and instruction files are the same or inside one another.
     pub fn resolve(
         &self,
         manifest: &Manifest,
-        home: &Path,
+        home: &HomeDir,
     ) -> Result<Vec<ResolvedDestination>, Vec<Problem>> {
         let mut problems = Vec::new();
         for name in self.destinations.keys() {
@@ -161,7 +162,7 @@ impl MachineConfig {
             });
         }
 
-        check_shared_paths(&resolved, &mut problems);
+        check_paths(&resolved, home, &mut problems);
         if problems.is_empty() {
             Ok(resolved)
         } else {
@@ -170,11 +171,15 @@ impl MachineConfig {
     }
 }
 
-/// Reports enabled Destinations that would write to the same Skills
-/// directory or global instruction file.
-fn check_shared_paths(resolved: &[ResolvedDestination], problems: &mut Vec<Problem>) {
-    let mut owners: BTreeMap<&Path, &Name> = BTreeMap::new();
-    for destination in resolved.iter().filter(|destination| destination.enabled) {
+/// Reports Destination paths that would put managed files among unrelated
+/// ones: any path that is the home directory or one of its parents, and,
+/// across enabled Destinations, Skills directories and instruction files that
+/// are the same or inside one another, so that no install writes into
+/// another's tree.
+fn check_paths(resolved: &[ResolvedDestination], home: &HomeDir, problems: &mut Vec<Problem>) {
+    let mut written: Vec<(&Name, &str, &Path)> = Vec::new();
+    for destination in resolved {
+        let at = format!("destinations.{}", destination.name);
         let instruction_file = destination
             .instructions
             .as_ref()
@@ -183,15 +188,42 @@ fn check_shared_paths(resolved: &[ResolvedDestination], problems: &mut Vec<Probl
             .into_iter()
             .chain(instruction_file);
         for (what, path) in paths {
-            if let Some(other) = owners.insert(path, &destination.name) {
+            let shown = path.display();
+            if home.as_path().starts_with(path) {
                 problems.push(Problem::new(
-                    format!("destinations.{}", destination.name),
+                    at.clone(),
                     format!(
-                        "its {what} {} is also written by enabled Destination `{other}`; give each enabled Destination its own paths",
-                        path.display()
+                        "its {what} {shown} is the home directory or one of its parents; choose a dedicated path below the home directory"
                     ),
                 ));
             }
+            if !destination.enabled {
+                continue;
+            }
+            for &(other, other_what, other_path) in &written {
+                let owner = if *other == destination.name {
+                    format!("its own {other_what}")
+                } else {
+                    format!("the {other_what} of enabled Destination `{other}`")
+                };
+                let other_shown = other_path.display();
+                let relation = if path == other_path {
+                    format!("is also {owner}")
+                } else if path.starts_with(other_path) {
+                    format!("is inside {other_shown}, {owner}")
+                } else if other_path.starts_with(path) {
+                    format!("contains {other_shown}, {owner}")
+                } else {
+                    continue;
+                };
+                problems.push(Problem::new(
+                    at.clone(),
+                    format!(
+                        "its {what} {shown} {relation}; give each enabled Destination its own paths, none inside another"
+                    ),
+                ));
+            }
+            written.push((&destination.name, what, path));
         }
     }
 }
@@ -245,11 +277,18 @@ skills_dir = "/srv/agents/skills"
         Manifest::from_toml(MANIFEST).unwrap()
     }
 
-    fn resolve(machine: &str) -> Result<Vec<ResolvedDestination>, Vec<String>> {
+    fn resolve_with(
+        manifest: &Manifest,
+        machine: &str,
+    ) -> Result<Vec<ResolvedDestination>, Vec<String>> {
         MachineConfig::from_toml(machine)
             .unwrap()
-            .resolve(&manifest(), Path::new(HOME))
+            .resolve(manifest, &HomeDir::new(HOME).unwrap())
             .map_err(|problems| problems.iter().map(ToString::to_string).collect())
+    }
+
+    fn resolve(machine: &str) -> Result<Vec<ResolvedDestination>, Vec<String>> {
+        resolve_with(&manifest(), machine)
     }
 
     fn by_name<'a>(resolved: &'a [ResolvedDestination], name: &str) -> &'a ResolvedDestination {
@@ -398,12 +437,125 @@ instruction_file = "~/work/AGENTS.md"
             "[destinations.shared]\nskills_dir = '~/.claude/skills'\n[destinations.pi]\ninstruction_file = '~/.claude/CLAUDE.md'\n",
         )
         .unwrap_err();
-        assert_eq!(problems.len(), 2, "{problems:?}");
-        assert!(problems[0].starts_with("destinations.pi: its instruction file /home/user/.claude/CLAUDE.md is also written by enabled Destination `claude`"));
-        assert!(problems[1].starts_with("destinations.shared: its Skills directory /home/user/.claude/skills is also written by enabled Destination `claude`"));
+        assert_eq!(
+            problems,
+            [
+                "destinations.pi: its instruction file /home/user/.claude/CLAUDE.md is also the instruction file of enabled Destination `claude`; give each enabled Destination its own paths, none inside another",
+                "destinations.shared: its Skills directory /home/user/.claude/skills is also the Skills directory of enabled Destination `claude`; give each enabled Destination its own paths, none inside another",
+            ]
+        );
 
         // A disabled Destination may share paths: it writes nothing.
         assert!(resolve("[destinations.agy]\nskills_dir = '~/.claude/skills'\n").is_ok());
+    }
+
+    #[test]
+    fn reports_enabled_destination_paths_inside_one_another() {
+        // A Skills directory inside another Destination's Skills directory,
+        // in both declaration orders.
+        let problems = resolve("[destinations.shared]\nskills_dir = '~/.claude'\n").unwrap_err();
+        assert_eq!(
+            problems,
+            [
+                "destinations.shared: its Skills directory /home/user/.claude contains /home/user/.claude/skills, the Skills directory of enabled Destination `claude`; give each enabled Destination its own paths, none inside another",
+                "destinations.shared: its Skills directory /home/user/.claude contains /home/user/.claude/CLAUDE.md, the instruction file of enabled Destination `claude`; give each enabled Destination its own paths, none inside another",
+            ]
+        );
+        let problems =
+            resolve("[destinations.shared]\nskills_dir = '~/.claude/skills/nested'\n").unwrap_err();
+        assert_eq!(
+            problems,
+            [
+                "destinations.shared: its Skills directory /home/user/.claude/skills/nested is inside /home/user/.claude/skills, the Skills directory of enabled Destination `claude`; give each enabled Destination its own paths, none inside another",
+            ]
+        );
+
+        // An instruction file inside another Destination's Skills directory,
+        // or inside the Destination's own.
+        let problems =
+            resolve("[destinations.pi]\ninstruction_file = '~/.claude/skills/x.md'\n").unwrap_err();
+        assert_eq!(
+            problems,
+            [
+                "destinations.pi: its instruction file /home/user/.claude/skills/x.md is inside /home/user/.claude/skills, the Skills directory of enabled Destination `claude`; give each enabled Destination its own paths, none inside another",
+            ]
+        );
+        let problems =
+            resolve("[destinations.pi]\ninstruction_file = '~/.pi/agent/skills/AGENTS.md'\n")
+                .unwrap_err();
+        assert_eq!(
+            problems,
+            [
+                "destinations.pi: its instruction file /home/user/.pi/agent/skills/AGENTS.md is inside /home/user/.pi/agent/skills, its own Skills directory; give each enabled Destination its own paths, none inside another",
+            ]
+        );
+
+        // Sibling paths with a common name prefix are not nested.
+        assert!(resolve("[destinations.shared]\nskills_dir = '~/.claude/skills-extra'\n").is_ok());
+        // A disabled Destination may nest: it writes nothing.
+        assert!(resolve("[destinations.agy]\nskills_dir = '~/.claude'\n").is_ok());
+    }
+
+    #[test]
+    fn reports_paths_at_or_above_the_home_directory() {
+        let problems = resolve(
+            "[destinations.shared]\nskills_dir = '/home/user'\n[destinations.agy]\nskills_dir = '/home'\n",
+        )
+        .unwrap_err();
+        assert_eq!(
+            problems,
+            [
+                "destinations.agy: its Skills directory /home is the home directory or one of its parents; choose a dedicated path below the home directory",
+                "destinations.shared: its Skills directory /home/user is the home directory or one of its parents; choose a dedicated path below the home directory",
+                "destinations.shared: its Skills directory /home/user contains /home/user/.claude/skills, the Skills directory of enabled Destination `claude`; give each enabled Destination its own paths, none inside another",
+                "destinations.shared: its Skills directory /home/user contains /home/user/.claude/CLAUDE.md, the instruction file of enabled Destination `claude`; give each enabled Destination its own paths, none inside another",
+                "destinations.shared: its Skills directory /home/user contains /home/user/.pi/agent/skills, the Skills directory of enabled Destination `pi`; give each enabled Destination its own paths, none inside another",
+                "destinations.shared: its Skills directory /home/user contains /home/user/.pi/agent/AGENTS.md, the instruction file of enabled Destination `pi`; give each enabled Destination its own paths, none inside another",
+            ]
+        );
+        let problems = resolve("[destinations.pi]\ninstruction_file = '/home/user'\n").unwrap_err();
+        assert!(
+            problems[0].starts_with(
+                "destinations.pi: its instruction file /home/user is the home directory or one of its parents"
+            ),
+            "{problems:?}"
+        );
+        // `~` and `/` alone are rejected when parsing.
+        for path in ["~", "/"] {
+            let err =
+                MachineConfig::from_toml(&format!("[destinations.pi]\nskills_dir = '{path}'\n"))
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                err.contains("not the filesystem root or the home directory itself"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn machines_may_each_enable_one_of_two_destinations_sharing_a_file() {
+        let manifest = Manifest::from_toml(
+            "[destinations.laptop]\nharness = 'claude-code'\ninstructions = { file = '~/.claude/CLAUDE.md', fragments = ['fragments/a.md'] }\n\
+             [destinations.server]\nharness = 'generic'\nskills_dir = '~/srv-skills'\nenabled = false\ninstructions = { file = '~/.claude/CLAUDE.md', fragments = ['fragments/b.md'] }\n",
+        )
+        .unwrap();
+        assert!(resolve_with(&manifest, "").is_ok());
+        assert!(
+            resolve_with(
+                &manifest,
+                "[destinations.laptop]\nenabled = false\n[destinations.server]\nenabled = true\n"
+            )
+            .is_ok()
+        );
+        let problems =
+            resolve_with(&manifest, "[destinations.server]\nenabled = true\n").unwrap_err();
+        assert_eq!(
+            problems,
+            [
+                "destinations.server: its instruction file /home/user/.claude/CLAUDE.md is also the instruction file of enabled Destination `laptop`; give each enabled Destination its own paths, none inside another",
+            ]
+        );
     }
 
     #[test]

@@ -4,11 +4,13 @@
 
 use std::error::Error;
 use std::fs;
+use std::os::unix::fs::symlink;
 use std::path::Path;
 
 use skill_curator::collection::lock::{LOCK_FORMAT, Lock, LockedSkill};
 use skill_curator::collection::{Collection, CollectionError};
-use skill_curator::safety::Name;
+use skill_curator::hash::HashError;
+use skill_curator::safety::{HomeDir, Name};
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -235,11 +237,191 @@ fn rejects_an_unsupported_lock_format() -> TestResult {
 }
 
 #[test]
+fn reports_a_newer_lock_format_before_its_schema() -> TestResult {
+    let dir = collection()?;
+    for lock in [
+        "format = 2\nfoo = 1\n",
+        "format = 2\n[skills.grill-me]\noutput_hash = 'blake3:abc'\n",
+    ] {
+        write(dir.path(), "lock.toml", lock)?;
+        let problems = load_problems(dir.path())?;
+        assert_eq!(
+            problems,
+            [format!(
+                "format: lock format 2 is not supported by this release, which reads format {LOCK_FORMAT}; upgrade skill-curator"
+            )],
+            "{lock}"
+        );
+    }
+
+    // A current lock that breaks the schema still gets the precise error.
+    write(dir.path(), "lock.toml", "format = 1\nfoo = 1\n")?;
+    let err = Collection::load(dir.path())
+        .err()
+        .ok_or("an unknown lock key must fail")?;
+    assert!(matches!(err, CollectionError::Parse { .. }), "{err}");
+    assert!(err.to_string().contains("unknown field `foo`"), "{err}");
+    Ok(())
+}
+
+#[test]
+fn reports_lock_consistency_problems() -> TestResult {
+    let dir = collection()?;
+    let revision = "0".repeat(40);
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let entry = format!(
+        "[[skills.code-review.provenance]]\ninput = 'review'\nsource = 'mattpocock'\nurl = 'u'\nupstream_path = 'skills/review'\nrevision = '{revision}'\n"
+    );
+    write(
+        dir.path(),
+        "lock.toml",
+        &format!("format = 1\n[skills.code-review]\noutput_hash = '{hash}'\n{entry}{entry}"),
+    )?;
+    let problems = load_problems(dir.path())?;
+    assert_eq!(
+        problems,
+        [
+            "skills.code-review.provenance: input `review` has more than one provenance entry; record each Composition input once"
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn rejects_referenced_files_reached_through_symbolic_links() -> TestResult {
+    let outside = TempDir::new()?;
+    write(outside.path(), "grilling.md", "Outside intent.\n")?;
+    write(outside.path(), "code-review.md", "Outside intent.\n")?;
+    write(outside.path(), "claude.md", "Outside Fragment.\n")?;
+    write(outside.path(), "skill/SKILL.md", "---\nname: x\n---\n")?;
+
+    let dir = collection()?;
+    let root = dir.path();
+    // A symlinked directory, a symlinked file, and a symlinked Skill.
+    fs::remove_dir_all(root.join("intents"))?;
+    symlink(outside.path(), root.join("intents"))?;
+    fs::remove_file(root.join("fragments/claude.md"))?;
+    symlink(
+        outside.path().join("claude.md"),
+        root.join("fragments/claude.md"),
+    )?;
+    fs::remove_dir_all(root.join("skills/fr-learner-voice"))?;
+    symlink(
+        outside.path().join("skill"),
+        root.join("skills/fr-learner-voice"),
+    )?;
+
+    let problems = load_problems(root)?;
+    let intents = root.join("intents");
+    let skill = root.join("skills/fr-learner-voice");
+    let fragment = root.join("fragments/claude.md");
+    assert_eq!(
+        problems,
+        [
+            format!(
+                "skills.code-review.intent: written intent `intents/code-review.md` is reached through the symbolic link {}; replace it with a regular file in the Collection",
+                intents.display()
+            ),
+            format!(
+                "skills.fr-learner-voice: local Skill `skills/fr-learner-voice/SKILL.md` is reached through the symbolic link {}; keep the Skill as regular files in the Collection",
+                skill.display()
+            ),
+            format!(
+                "skills.grilling.intent: written intent `intents/grilling.md` is reached through the symbolic link {}; replace it with a regular file in the Collection",
+                intents.display()
+            ),
+            format!(
+                "destinations.claude.instructions.fragments: Fragment `fragments/claude.md` is reached through the symbolic link {}; replace it with a regular file in the Collection",
+                fragment.display()
+            ),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn rejects_a_referenced_path_that_is_not_a_regular_file() -> TestResult {
+    let dir = collection()?;
+    fs::remove_file(dir.path().join("fragments/git.md"))?;
+    fs::create_dir(dir.path().join("fragments/git.md"))?;
+    let problems = load_problems(dir.path())?;
+    assert_eq!(
+        problems,
+        [
+            "destinations.claude.instructions.fragments: Fragment `fragments/git.md` is not a regular file",
+            "destinations.pi.instructions.fragments: Fragment `fragments/git.md` is not a regular file",
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn inputs_digest_refuses_an_intent_replaced_by_a_symbolic_link() -> TestResult {
+    let outside = TempDir::new()?;
+    write(outside.path(), "secret", "not an intent\n")?;
+    let dir = collection()?;
+    let collection = Collection::load(dir.path())?;
+    fs::remove_file(dir.path().join("intents/grilling.md"))?;
+    symlink(
+        outside.path().join("secret"),
+        dir.path().join("intents/grilling.md"),
+    )?;
+    let err = collection
+        .inputs_digest(&name("grilling")?)
+        .err()
+        .ok_or("a symlinked intent must not be hashed")?;
+    assert!(
+        err.to_string()
+            .contains("skills.grilling.intent: written intent `intents/grilling.md` is reached through the symbolic link"),
+        "{err}"
+    );
+    Ok(())
+}
+
+#[test]
+fn output_digest_refuses_a_skill_reached_through_a_symbolic_link() -> TestResult {
+    let outside = TempDir::new()?;
+    write(
+        outside.path(),
+        "grilling/SKILL.md",
+        "---\nname: grilling\n---\n",
+    )?;
+    let dir = collection()?;
+    let collection = Collection::load(dir.path())?;
+
+    // The Skill directory itself is a link.
+    let link = dir.path().join("skills/grilling");
+    symlink(outside.path().join("grilling"), &link)?;
+    let err = collection
+        .output_digest(&name("grilling")?)
+        .err()
+        .ok_or("a symlinked Skill directory must not be hashed")?;
+    assert!(
+        matches!(err, CollectionError::Hash(HashError::Symlink { ref path }) if *path == link),
+        "{err}"
+    );
+
+    // The whole `skills/` directory is a link.
+    fs::rename(dir.path().join("skills"), outside.path().join("skills"))?;
+    symlink(outside.path().join("skills"), dir.path().join("skills"))?;
+    let err = collection
+        .output_digest(&name("fr-learner-voice")?)
+        .err()
+        .ok_or("a Skill under a symlinked `skills/` must not be hashed")?;
+    assert!(
+        matches!(err, CollectionError::Hash(HashError::Symlink { ref path }) if *path == dir.path().join("skills")),
+        "{err}"
+    );
+    Ok(())
+}
+
+#[test]
 fn missing_machine_config_keeps_portable_destinations() -> TestResult {
     let dir = collection()?;
-    let home = dir.path().join("home");
+    let home = HomeDir::new(dir.path().join("home"))?;
     let collection = Collection::load(dir.path())?;
     let destinations = collection.destinations(&dir.path().join("absent/machine.toml"), &home)?;
+    let home = home.as_path();
     let summary = destinations
         .iter()
         .map(|destination| (destination.name.as_str(), destination.enabled))
@@ -259,7 +441,7 @@ fn missing_machine_config_keeps_portable_destinations() -> TestResult {
 #[test]
 fn machine_config_merges_over_portable_destinations() -> TestResult {
     let dir = collection()?;
-    let home = dir.path().join("home");
+    let home = HomeDir::new(dir.path().join("home"))?;
     let machine = dir.path().join("config/machine.toml");
     write(
         dir.path(),
@@ -268,6 +450,7 @@ fn machine_config_merges_over_portable_destinations() -> TestResult {
     )?;
     let collection = Collection::load(dir.path())?;
     let destinations = collection.destinations(&machine, &home)?;
+    let home = home.as_path();
     let summary = destinations
         .iter()
         .map(|destination| {
@@ -293,6 +476,7 @@ fn machine_config_merges_over_portable_destinations() -> TestResult {
 fn machine_config_errors_name_the_machine_file() -> TestResult {
     let dir = collection()?;
     let machine = dir.path().join("machine.toml");
+    let home = HomeDir::new(dir.path())?;
     let collection = Collection::load(dir.path())?;
 
     write(
@@ -301,7 +485,7 @@ fn machine_config_errors_name_the_machine_file() -> TestResult {
         "[destinations.cursor]\nenabled = true\n",
     )?;
     let err = collection
-        .destinations(&machine, dir.path())
+        .destinations(&machine, &home)
         .err()
         .ok_or("an undeclared Destination must fail")?
         .to_string();
@@ -316,7 +500,7 @@ fn machine_config_errors_name_the_machine_file() -> TestResult {
         "[destinations.pi]\nskills_dir = 'pi'\n",
     )?;
     let err = collection
-        .destinations(&machine, dir.path())
+        .destinations(&machine, &home)
         .err()
         .ok_or("a relative path must fail")?
         .to_string();
@@ -407,6 +591,43 @@ fn inputs_digests_detect_rule_preset_and_intent_changes() -> TestResult {
     let digests = inputs_digests(dir.path())?;
     assert_eq!(digests[..2], original[..2]);
     assert_ne!(digests[2], original[2]);
+    Ok(())
+}
+
+#[test]
+fn inputs_digests_ignore_preset_names() -> TestResult {
+    let dir = collection()?;
+    let original = inputs_digests(dir.path())?;
+    write(
+        dir.path(),
+        "manifest.toml",
+        &MANIFEST.replace("cursor-cleanup", "cleanup"),
+    )?;
+    assert_eq!(inputs_digests(dir.path())?, original);
+
+    // Preset order is part of the inputs: later rules apply over earlier ones.
+    let two_presets = MANIFEST
+        .replace(
+            "[skills.grill-me]",
+            "[presets.extra]\nfiles = { exclude = ['x/**'] }\n\n[skills.grill-me]",
+        )
+        .replace(
+            "presets = [\"cursor-cleanup\"]",
+            "presets = [\"cursor-cleanup\", \"extra\"]",
+        );
+    write(dir.path(), "manifest.toml", &two_presets)?;
+    let forward = inputs_digests(dir.path())?;
+    write(
+        dir.path(),
+        "manifest.toml",
+        &two_presets.replace(
+            "presets = [\"cursor-cleanup\", \"extra\"]",
+            "presets = [\"extra\", \"cursor-cleanup\"]",
+        ),
+    )?;
+    let backward = inputs_digests(dir.path())?;
+    assert_ne!(forward[1], original[1]);
+    assert_ne!(backward[1], forward[1]);
     Ok(())
 }
 
