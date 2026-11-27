@@ -81,7 +81,12 @@ fn write(root: &Path, relative: &str, contents: &str) -> TestResult {
 /// A complete, valid Collection in a temporary directory.
 fn collection() -> Result<TempDir, Box<dyn Error>> {
     let dir = TempDir::new()?;
-    let root = dir.path();
+    populate(dir.path())?;
+    Ok(dir)
+}
+
+/// Writes a complete, valid Collection at `root`.
+fn populate(root: &Path) -> TestResult {
     write(root, "manifest.toml", MANIFEST)?;
     write(root, "intents/grilling.md", "Keep turns short.\n")?;
     write(root, "intents/code-review.md", "Combine both reviews.\n")?;
@@ -91,8 +96,7 @@ fn collection() -> Result<TempDir, Box<dyn Error>> {
         root,
         "skills/fr-learner-voice/SKILL.md",
         "---\nname: fr-learner-voice\n---\nBody\n",
-    )?;
-    Ok(dir)
+    )
 }
 
 fn name(raw: &str) -> Result<Name, Box<dyn Error>> {
@@ -418,7 +422,8 @@ fn output_digest_refuses_a_skill_reached_through_a_symbolic_link() -> TestResult
 #[test]
 fn missing_machine_config_keeps_portable_destinations() -> TestResult {
     let dir = collection()?;
-    let home = HomeDir::new(dir.path().join("home"))?;
+    let home_dir = TempDir::new()?;
+    let home = HomeDir::new(home_dir.path())?;
     let collection = Collection::load(dir.path())?;
     let destinations = collection.destinations(&dir.path().join("absent/machine.toml"), &home)?;
     let home = home.as_path();
@@ -441,7 +446,8 @@ fn missing_machine_config_keeps_portable_destinations() -> TestResult {
 #[test]
 fn machine_config_merges_over_portable_destinations() -> TestResult {
     let dir = collection()?;
-    let home = HomeDir::new(dir.path().join("home"))?;
+    let home_dir = TempDir::new()?;
+    let home = HomeDir::new(home_dir.path())?;
     let machine = dir.path().join("config/machine.toml");
     write(
         dir.path(),
@@ -476,7 +482,8 @@ fn machine_config_merges_over_portable_destinations() -> TestResult {
 fn machine_config_errors_name_the_machine_file() -> TestResult {
     let dir = collection()?;
     let machine = dir.path().join("machine.toml");
-    let home = HomeDir::new(dir.path())?;
+    let home_dir = TempDir::new()?;
+    let home = HomeDir::new(home_dir.path())?;
     let collection = Collection::load(dir.path())?;
 
     write(
@@ -506,6 +513,87 @@ fn machine_config_errors_name_the_machine_file() -> TestResult {
         .to_string();
     assert!(err.contains("machine.toml"), "{err}");
     assert!(err.contains("not a valid installation path"), "{err}");
+    Ok(())
+}
+
+#[test]
+fn destinations_may_not_overlap_the_collection() -> TestResult {
+    let home_dir = TempDir::new()?;
+    let home_path = fs::canonicalize(home_dir.path())?;
+    let home = HomeDir::new(&home_path)?;
+    let root = home_path.join("lab/collection");
+    populate(&root)?;
+    // The same Collection, also reached through a symbolic link.
+    let link = home_path.join("link");
+    symlink(&root, &link)?;
+    let machine = home_path.join("machine.toml");
+
+    for (loaded_from, settings, expected) in [
+        (
+            &root,
+            "[destinations.pi]\nskills_dir = '~/lab/collection/skills'\n",
+            format!(
+                "destinations.pi: its Skills directory {} is inside the Collection root {}; choose a path outside the Collection",
+                root.join("skills").display(),
+                root.display()
+            ),
+        ),
+        (
+            &root,
+            "[destinations.claude]\ninstruction_file = '~/lab/collection/manifest.toml'\n",
+            format!(
+                "destinations.claude: its instruction file {} is inside the Collection root {}; choose a path outside the Collection",
+                root.join("manifest.toml").display(),
+                root.display()
+            ),
+        ),
+        (
+            &root,
+            "[destinations.pi]\nskills_dir = '~/lab'\n",
+            format!(
+                "destinations.pi: its Skills directory {} contains the Collection root {}; choose a path outside the Collection",
+                home_path.join("lab").display(),
+                root.display()
+            ),
+        ),
+        // Loaded through the link: both the link and the real path count.
+        (
+            &link,
+            "[destinations.pi]\nskills_dir = '~/link/skills'\n",
+            format!(
+                "destinations.pi: its Skills directory {} is inside the Collection root {}; choose a path outside the Collection",
+                link.join("skills").display(),
+                link.display()
+            ),
+        ),
+        (
+            &link,
+            "[destinations.pi]\nskills_dir = '~/lab/collection/skills'\n",
+            format!(
+                "destinations.pi: its Skills directory {} is inside the Collection root {}; choose a path outside the Collection",
+                root.join("skills").display(),
+                root.display()
+            ),
+        ),
+    ] {
+        fs::write(&machine, settings)?;
+        let collection = Collection::load(loaded_from)?;
+        match collection.destinations(&machine, &home) {
+            Err(CollectionError::Invalid { path, problems }) => {
+                assert_eq!(path, machine);
+                let problems = problems.iter().map(ToString::to_string).collect::<Vec<_>>();
+                assert_eq!(problems, [expected], "{settings}");
+            }
+            other => return Err(format!("{settings}: expected a problem, got {other:?}").into()),
+        }
+    }
+
+    // A sibling of the Collection is outside it.
+    fs::write(
+        &machine,
+        "[destinations.pi]\nskills_dir = '~/lab/collection-skills'\n",
+    )?;
+    Collection::load(&root)?.destinations(&machine, &home)?;
     Ok(())
 }
 

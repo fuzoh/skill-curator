@@ -18,7 +18,7 @@ pub mod manifest;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
@@ -232,11 +232,16 @@ impl Collection {
     /// no machine-local settings. `home` replaces a leading `~` in paths, so
     /// every resolved path is absolute.
     ///
+    /// No resolved path may be, lie inside, or contain the Collection root,
+    /// compared both with its canonical path and with its absolute path as
+    /// given, so that `install` never writes over the Collection.
+    ///
     /// # Errors
     ///
-    /// Returns a [`CollectionError`] when `machine.toml` exists but cannot be
-    /// read or parsed, or when it does not fit the Manifest (see
-    /// [`MachineConfig::resolve`]).
+    /// Returns a [`CollectionError`] when the Collection root cannot be
+    /// resolved, when `machine.toml` exists but cannot be read or parsed, or
+    /// when the result does not fit the Manifest or overlaps the Collection
+    /// (see [`MachineConfig::resolve`]).
     pub fn destinations(
         &self,
         machine_config: &Path,
@@ -247,11 +252,26 @@ impl Collection {
             None => MachineConfig::default(),
         };
         machine
-            .resolve(&self.manifest, home)
+            .resolve(&self.manifest, home, &self.root_forms()?)
             .map_err(|problems| CollectionError::Invalid {
                 path: machine_config.to_path_buf(),
                 problems,
             })
+    }
+
+    /// Absolute forms of the Collection root: canonical (symbolic links
+    /// resolved) and, when it differs and has no `..` component, as given.
+    fn root_forms(&self) -> Result<Vec<PathBuf>, CollectionError> {
+        let read_error = |source| CollectionError::Read {
+            path: self.root.clone(),
+            source,
+        };
+        let mut forms = vec![fs::canonicalize(&self.root).map_err(read_error)?];
+        let given = std::path::absolute(&self.root).map_err(read_error)?;
+        if !given.components().any(|c| c == Component::ParentDir) && !forms.contains(&given) {
+            forms.push(given);
+        }
+        Ok(forms)
     }
 
     /// Hash of the accepted materialised Skill directory `skills/<name>/`.

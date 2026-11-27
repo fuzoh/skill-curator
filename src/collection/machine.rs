@@ -88,17 +88,23 @@ impl MachineConfig {
     /// Merges these machine-local settings over the Manifest's portable
     /// Destinations, expanding `~` to `home`.
     ///
+    /// `collection_roots` lists the absolute forms of the Collection root
+    /// (for example canonical and as given); no Destination path may be,
+    /// lie inside, or contain any of them.
+    ///
     /// # Errors
     ///
     /// Returns the problems found: settings for a Destination the Manifest
     /// does not declare, an instruction file for a Destination without
     /// instructions, a missing Skills directory, a path that is the home
-    /// directory or one of its parents, or enabled Destinations whose Skills
+    /// directory or one of its parents, a path that is, lies inside, or
+    /// contains the Collection root, or enabled Destinations whose Skills
     /// directories and instruction files are the same or inside one another.
     pub fn resolve(
         &self,
         manifest: &Manifest,
         home: &HomeDir,
+        collection_roots: &[PathBuf],
     ) -> Result<Vec<ResolvedDestination>, Vec<Problem>> {
         let mut problems = Vec::new();
         for name in self.destinations.keys() {
@@ -162,7 +168,7 @@ impl MachineConfig {
             });
         }
 
-        check_paths(&resolved, home, &mut problems);
+        check_paths(&resolved, home, collection_roots, &mut problems);
         if problems.is_empty() {
             Ok(resolved)
         } else {
@@ -172,11 +178,17 @@ impl MachineConfig {
 }
 
 /// Reports Destination paths that would put managed files among unrelated
-/// ones: any path that is the home directory or one of its parents, and,
-/// across enabled Destinations, Skills directories and instruction files that
-/// are the same or inside one another, so that no install writes into
-/// another's tree.
-fn check_paths(resolved: &[ResolvedDestination], home: &HomeDir, problems: &mut Vec<Problem>) {
+/// ones: any path that is the home directory or one of its parents, any path
+/// that is, lies inside, or contains the Collection root, and, across enabled
+/// Destinations, Skills directories and instruction files that are the same
+/// or inside one another, so that no install writes into the Collection or
+/// another Destination's tree.
+fn check_paths(
+    resolved: &[ResolvedDestination],
+    home: &HomeDir,
+    collection_roots: &[PathBuf],
+    problems: &mut Vec<Problem>,
+) {
     let mut written: Vec<(&Name, &str, &Path)> = Vec::new();
     for destination in resolved {
         let at = format!("destinations.{}", destination.name);
@@ -194,6 +206,27 @@ fn check_paths(resolved: &[ResolvedDestination], home: &HomeDir, problems: &mut 
                     at.clone(),
                     format!(
                         "its {what} {shown} is the home directory or one of its parents; choose a dedicated path below the home directory"
+                    ),
+                ));
+            }
+            // One report per path, even when the root has several forms.
+            let collection_clash = collection_roots.iter().find_map(|root| {
+                let relation = if path == root {
+                    "is"
+                } else if path.starts_with(root) {
+                    "is inside"
+                } else if root.starts_with(path) {
+                    "contains"
+                } else {
+                    return None;
+                };
+                Some((relation, root.display()))
+            });
+            if let Some((relation, root)) = collection_clash {
+                problems.push(Problem::new(
+                    at.clone(),
+                    format!(
+                        "its {what} {shown} {relation} the Collection root {root}; choose a path outside the Collection"
                     ),
                 ));
             }
@@ -253,6 +286,7 @@ mod tests {
     use super::*;
 
     const HOME: &str = "/home/user";
+    const COLLECTION: &str = "/home/user/lab/collection";
 
     const MANIFEST: &str = r#"
 [destinations.claude]
@@ -283,7 +317,11 @@ skills_dir = "/srv/agents/skills"
     ) -> Result<Vec<ResolvedDestination>, Vec<String>> {
         MachineConfig::from_toml(machine)
             .unwrap()
-            .resolve(manifest, &HomeDir::new(HOME).unwrap())
+            .resolve(
+                manifest,
+                &HomeDir::new(HOME).unwrap(),
+                &[PathBuf::from(COLLECTION)],
+            )
             .map_err(|problems| problems.iter().map(ToString::to_string).collect())
     }
 
@@ -506,7 +544,9 @@ instruction_file = "~/work/AGENTS.md"
             problems,
             [
                 "destinations.agy: its Skills directory /home is the home directory or one of its parents; choose a dedicated path below the home directory",
+                "destinations.agy: its Skills directory /home contains the Collection root /home/user/lab/collection; choose a path outside the Collection",
                 "destinations.shared: its Skills directory /home/user is the home directory or one of its parents; choose a dedicated path below the home directory",
+                "destinations.shared: its Skills directory /home/user contains the Collection root /home/user/lab/collection; choose a path outside the Collection",
                 "destinations.shared: its Skills directory /home/user contains /home/user/.claude/skills, the Skills directory of enabled Destination `claude`; give each enabled Destination its own paths, none inside another",
                 "destinations.shared: its Skills directory /home/user contains /home/user/.claude/CLAUDE.md, the instruction file of enabled Destination `claude`; give each enabled Destination its own paths, none inside another",
                 "destinations.shared: its Skills directory /home/user contains /home/user/.pi/agent/skills, the Skills directory of enabled Destination `pi`; give each enabled Destination its own paths, none inside another",
@@ -531,6 +571,74 @@ instruction_file = "~/work/AGENTS.md"
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn reports_paths_that_are_inside_or_contain_the_collection() {
+        for (machine, expected) in [
+            (
+                "[destinations.shared]\nskills_dir = '~/lab/collection/skills'\n",
+                "destinations.shared: its Skills directory /home/user/lab/collection/skills is inside the Collection root /home/user/lab/collection; choose a path outside the Collection",
+            ),
+            (
+                "[destinations.claude]\ninstruction_file = '~/lab/collection/manifest.toml'\n",
+                "destinations.claude: its instruction file /home/user/lab/collection/manifest.toml is inside the Collection root /home/user/lab/collection; choose a path outside the Collection",
+            ),
+            (
+                "[destinations.pi]\nskills_dir = '~/lab'\n",
+                "destinations.pi: its Skills directory /home/user/lab contains the Collection root /home/user/lab/collection; choose a path outside the Collection",
+            ),
+            (
+                "[destinations.shared]\nskills_dir = '~/lab/collection'\n",
+                "destinations.shared: its Skills directory /home/user/lab/collection is the Collection root /home/user/lab/collection; choose a path outside the Collection",
+            ),
+        ] {
+            assert_eq!(resolve(machine).unwrap_err(), [expected], "{machine}");
+        }
+
+        // Every form of the root is checked, each path reported once.
+        let manifest = manifest();
+        let home = HomeDir::new(HOME).unwrap();
+        let roots = [
+            PathBuf::from("/srv/real/collection"),
+            PathBuf::from(COLLECTION),
+        ];
+        let problems = MachineConfig::from_toml(
+            "[destinations.shared]\nskills_dir = '/srv/real/collection/skills'\n\
+             [destinations.pi]\nskills_dir = '~/lab/collection/skills'\n",
+        )
+        .unwrap()
+        .resolve(&manifest, &home, &roots)
+        .unwrap_err()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            problems,
+            [
+                "destinations.pi: its Skills directory /home/user/lab/collection/skills is inside the Collection root /home/user/lab/collection; choose a path outside the Collection",
+                "destinations.shared: its Skills directory /srv/real/collection/skills is inside the Collection root /srv/real/collection; choose a path outside the Collection",
+            ]
+        );
+        let problems = MachineConfig::from_toml(
+            "[destinations.shared]\nskills_dir = '/srv/real/collection'\n",
+        )
+        .unwrap()
+        .resolve(
+            &manifest,
+            &home,
+            &[
+                PathBuf::from("/srv/real/collection"),
+                PathBuf::from("/srv/real/collection"),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+
+        // Disabled Destinations are checked too; siblings with a common name
+        // prefix are not nested.
+        assert!(resolve("[destinations.agy]\nskills_dir = '~/lab/collection/x'\n").is_err());
+        assert!(resolve("[destinations.shared]\nskills_dir = '~/lab/collection-skills'\n").is_ok());
     }
 
     #[test]

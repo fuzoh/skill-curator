@@ -171,7 +171,10 @@ the Rust types in `src/collection/` are the reference. Choices made there:
   `instructions = { file, fragments }`, and install-time `frontmatter` rules.
   `machine.toml` can change `enabled`, `skills_dir`, and `instruction_file`
   for declared Destinations only. Installation paths are never `/` or `~`
-  alone, nor the home directory or one of its parents once expanded. Several
+  alone, nor the home directory or one of its parents once expanded, and
+  never the Collection root, a path inside it, or one containing it
+  (compared with the root both as given and with symbolic links resolved).
+  Several
   Destinations may name the same paths in the Manifest; on each machine, the
   Skills directories and instruction files of enabled Destinations must be
   distinct and none may lie inside another.
