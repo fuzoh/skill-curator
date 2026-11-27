@@ -2,11 +2,12 @@
 //! accepted for each Skill: pinned Revisions, integrity hashes, provenance,
 //! and detected licenses.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use super::Problem;
 use crate::hash::Digest;
 use crate::safety::{Name, RelativePath};
 
@@ -151,7 +152,26 @@ impl fmt::Display for InvalidRevision {
 
 impl std::error::Error for InvalidRevision {}
 
+/// The part of `lock.toml` every format shares: its format number.
+#[derive(Deserialize)]
+struct LockHeader {
+    format: u32,
+}
+
 impl Lock {
+    /// Format number declared by `lock.toml` text, read without checking the
+    /// rest of the file against this release's schema, so a lock written by
+    /// a newer release can be recognised as such.
+    ///
+    /// Returns `None` when the text is not valid TOML or has no integer
+    /// `format`; [`Lock::from_toml`] then reports the precise error.
+    #[must_use]
+    pub fn declared_format(text: &str) -> Option<u32> {
+        toml::from_str::<LockHeader>(text)
+            .ok()
+            .map(|header| header.format)
+    }
+
     /// Parses `lock.toml` text.
     ///
     /// # Errors
@@ -170,6 +190,31 @@ impl Lock {
     /// from parsed text.
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
         toml::to_string(self)
+    }
+
+    /// Consistency problems that parsing alone cannot catch: a Composition
+    /// input recorded by more than one provenance entry.
+    #[must_use]
+    pub fn problems(&self) -> Vec<Problem> {
+        let mut problems = Vec::new();
+        for (name, skill) in &self.skills {
+            let mut seen = BTreeSet::new();
+            for input in skill
+                .provenance
+                .iter()
+                .filter_map(|entry| entry.input.as_ref())
+            {
+                if !seen.insert(input) {
+                    problems.push(Problem::new(
+                        format!("skills.{name}.provenance"),
+                        format!(
+                            "input `{input}` has more than one provenance entry; record each Composition input once"
+                        ),
+                    ));
+                }
+            }
+        }
+        problems
     }
 }
 
@@ -337,6 +382,38 @@ output_hash = "{a}"
             let err = Lock::from_toml(&text).unwrap_err().to_string();
             assert!(err.contains(expected), "expected {expected:?} in:\n{err}");
         }
+    }
+
+    #[test]
+    fn reads_the_format_of_newer_locks() {
+        assert_eq!(Lock::declared_format(&full()), Some(LOCK_FORMAT));
+        assert_eq!(
+            Lock::declared_format("format = 2\nfoo = 1\n[skills.x]\noutput_hash = 'md5:x'\n"),
+            Some(2)
+        );
+        assert_eq!(Lock::declared_format("foo = 1\n"), None);
+        assert_eq!(Lock::declared_format("format = 'one'\n"), None);
+        assert_eq!(Lock::declared_format("format = \n"), None);
+    }
+
+    #[test]
+    fn reports_repeated_composition_inputs() {
+        let lock = Lock::from_toml(&full()).unwrap();
+        assert_eq!(lock.problems(), []);
+
+        let repeated = full().replacen("input = \"critique\"", "input = \"review\"", 1);
+        let problems = Lock::from_toml(&repeated)
+            .unwrap()
+            .problems()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            problems,
+            [
+                "skills.code-review.provenance: input `review` has more than one provenance entry; record each Composition input once"
+            ]
+        );
     }
 
     #[test]
