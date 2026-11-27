@@ -331,6 +331,41 @@ fn fetches_the_configured_branch() -> TestResult {
 }
 
 #[test]
+fn a_branch_can_change_to_a_nested_or_parent_name() -> TestResult {
+    let sandbox = Sandbox::new()?;
+    let upstream = sandbox.upstream("upstream")?;
+    upstream.write("skills/a/SKILL.md", "main\n")?;
+    upstream.commit("main")?;
+    let mut tips = Vec::new();
+    for branch in ["release", "release-next"] {
+        upstream.git(&["switch", "--quiet", "--create", branch, "main"])?;
+        upstream.write("skills/a/SKILL.md", &format!("{branch}\n"))?;
+        tips.push(upstream.commit(branch)?);
+    }
+    // Git cannot hold `release` and `release/v2` at once, so the second
+    // branch is published under its nested name in a separate step.
+    let nested = tips.pop().ok_or("no nested tip")?;
+    let release = tips.pop().ok_or("no release tip")?;
+    upstream.git(&["switch", "--quiet", "main"])?;
+
+    let cache = sandbox.cache();
+    let source_name = name("s")?;
+    let mut source = upstream.source();
+    source.branch = Some("release".to_owned());
+    assert_eq!(cache.fetch(&source_name, &source)?, release);
+
+    upstream.git(&["branch", "--quiet", "--delete", "--force", "release"])?;
+    upstream.git(&["branch", "--quiet", "--move", "release-next", "release/v2"])?;
+    source.branch = Some("release/v2".to_owned());
+    assert_eq!(cache.fetch(&source_name, &source)?, nested);
+
+    upstream.git(&["branch", "--quiet", "--move", "release/v2", "release"])?;
+    source.branch = Some("release".to_owned());
+    assert_eq!(cache.fetch(&source_name, &source)?, nested);
+    Ok(())
+}
+
+#[test]
 fn an_unreachable_old_revision_is_reported_distinctly() -> TestResult {
     let sandbox = Sandbox::new()?;
     let upstream = sandbox.upstream("upstream")?;

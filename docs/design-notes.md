@@ -210,7 +210,9 @@ Choices made there:
   Git configuration still applies, so credentials and URL rewrites keep
   working.
 - The candidate Revision is the tip of the Source's `branch`, or of the
-  remote `HEAD` when none is set, fetched without tags. Extracting a Revision
+  remote `HEAD` when none is set, fetched without tags into one tracking
+  reference, so changing `branch` (even from `release` to `release/v2`)
+  never collides with an older tracking reference. Extracting a Revision
   that is not cached fetches it by identifier; when that fails too, the
   typed `RevisionUnreachable` error lets callers fall back to a two-way
   comparison. Each extracted Revision is kept by a private reference, and

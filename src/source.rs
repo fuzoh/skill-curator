@@ -41,6 +41,8 @@ const CACHE_DIR_NAME: &str = "skill-curator";
 const SOURCES_DIR: &str = "sources";
 /// Hexadecimal digits of the URL hash in a cache repository name.
 const URL_HASH_LEN: usize = 16;
+/// Reference holding the tip last fetched from the Source's branch.
+const CANDIDATE_REF: &str = "refs/skill-curator/candidate";
 
 /// Failure to fetch a Source or extract a Skill from it.
 #[derive(Debug)]
@@ -290,21 +292,26 @@ impl SourceCache {
     pub fn fetch(&self, name: &Name, source: &Source) -> Result<Revision, SourceError> {
         check_source(name, source)?;
         let repository = self.ensure_repository(name, source)?;
-        let (wanted, local) = match &source.branch {
-            Some(branch) => (
-                format!("refs/heads/{branch}"),
-                format!("refs/skill-curator/branches/{branch}"),
-            ),
-            None => ("HEAD".to_owned(), "refs/skill-curator/default".to_owned()),
-        };
-        self.fetch_from(&repository, &source.url, &format!("+{wanted}:{local}"))?;
+        let wanted = source.branch.as_ref().map_or_else(
+            || "HEAD".to_owned(),
+            |branch| format!("refs/heads/{branch}"),
+        );
+        // One tracking reference whatever the branch: per-branch references
+        // would collide when the branch changes from `release` to
+        // `release/v2`, since Git cannot hold both. Older Revisions are kept
+        // by their own pins.
+        self.fetch_from(
+            &repository,
+            &source.url,
+            &format!("+{wanted}:{CANDIDATE_REF}"),
+        )?;
         let output = self.git.run(
             Some(&repository),
             &[
                 OsStr::new("rev-parse"),
                 OsStr::new("--verify"),
                 OsStr::new("--end-of-options"),
-                OsStr::new(&format!("{local}^{{commit}}")),
+                OsStr::new(&format!("{CANDIDATE_REF}^{{commit}}")),
             ],
         )?;
         let text = String::from_utf8_lossy(&output);
