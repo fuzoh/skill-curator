@@ -1,0 +1,39 @@
+[package]
+name = "skill-curator"
+version = "0.1.0"
+edition = "2024"
+description = "Download, adapt, and maintain third-party agent Skills in a user-owned Collection"
+license = "MIT"
+repository = "https://github.com/fuzoh/skill-curator"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "skill_curator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "skill-curator"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.10", features = ["derive"] }
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"
+
+# Targeted lint policy. Do not enable whole `pedantic` or `restriction` groups;
+# add individual lints with a stated reason instead. See CONTRIBUTING.md.
+[lints.rust]
+# The tool handles untrusted upstream content; it has no need for unsafe code.
+unsafe_code = "forbid"
+
+[lints.clippy]
+# Recoverable failures in production code must surface as errors, not panics.
+# Tests are exempted through `clippy.toml` (`allow-*-in-tests`).
+unwrap_used = "deny"
+expect_used = "deny"
+# Every local lint suppression must state why it is justified.
+allow_attributes_without_reason = "deny"

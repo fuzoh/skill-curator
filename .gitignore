@@ -1,2 +1,5 @@
 docs
 .claude
+/target
+/mutants.out/
+/mutants.out.old/
