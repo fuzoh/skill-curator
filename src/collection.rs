@@ -1,16 +1,18 @@
 //! The user-owned Collection: loading and validating `manifest.toml` and
-//! `lock.toml`, merging machine-local Destination settings, and hashing a
-//! Skill's inputs and accepted output.
+//! `lock.toml`, merging machine-local Destination settings, hashing a Skill's
+//! inputs and accepted output, and generating `ATTRIBUTION.md`.
 //!
 //! ```text
 //! <collection>/
 //! ├── manifest.toml   portable declarations (Manifest)
 //! ├── lock.toml       accepted Revisions, hashes, provenance, licenses
+//! ├── ATTRIBUTION.md  provenance and license notices, generated from the lock
 //! ├── intents/        written Adaptation and Composition intents
 //! ├── skills/<name>/  accepted materialised Skills
 //! └── fragments/      global instruction Fragments
 //! ```
 
+pub mod attribution;
 pub mod lock;
 pub mod machine;
 pub mod manifest;
@@ -94,6 +96,13 @@ pub enum CollectionError {
     },
     /// A Skill directory could not be hashed.
     Hash(HashError),
+    /// A generated file could not be written.
+    Write {
+        /// File that could not be written.
+        path: PathBuf,
+        /// Underlying error.
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for CollectionError {
@@ -112,6 +121,7 @@ impl fmt::Display for CollectionError {
                 write!(f, "Skill `{name}` is not declared in {MANIFEST_FILE}")
             }
             Self::Hash(source) => source.fmt(f),
+            Self::Write { path, source } => write!(f, "cannot write {}: {source}", path.display()),
         }
     }
 }
@@ -119,7 +129,7 @@ impl fmt::Display for CollectionError {
 impl std::error::Error for CollectionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Read { source, .. } => Some(source),
+            Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source.as_ref()),
             Self::Hash(source) => Some(source),
             Self::Invalid { .. } | Self::UnknownSkill { .. } => None,
