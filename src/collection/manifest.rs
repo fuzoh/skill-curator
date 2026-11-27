@@ -453,7 +453,7 @@ fn known<'a>(names: impl Iterator<Item = &'a Name>) -> String {
 
 /// Why `git` could misread `value` as a command-line argument: it is empty,
 /// starts like an option, or holds whitespace or control characters.
-fn git_argument_problem(what: &str, value: &str) -> Option<String> {
+pub(crate) fn git_argument_problem(what: &str, value: &str) -> Option<String> {
     if value.is_empty() {
         Some(format!("the {what} is empty"))
     } else if value.starts_with('-') {
@@ -472,7 +472,7 @@ fn git_argument_problem(what: &str, value: &str) -> Option<String> {
 /// Why `branch` is not a plain branch name under the `git check-ref-format`
 /// rules, or could be read as a refspec (`src:dst`, or a leading `+` that
 /// forces an update) or a revision expression (`a..b`, `@{1}`, `~`, `^`).
-fn branch_problem(branch: &str) -> Option<String> {
+pub(crate) fn branch_problem(branch: &str) -> Option<String> {
     if let Some(problem) = git_argument_problem("branch", branch) {
         return Some(problem);
     }

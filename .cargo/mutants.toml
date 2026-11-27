@@ -20,9 +20,11 @@ examine_globs = [
     # directory, Collection root, enabled Destinations inside one another).
     "src/collection.rs",
     "src/collection/machine.rs",
-    # Revision selection.
-    "src/revision.rs",
-    "src/revision/**/*.rs",
+    # Revision selection, unreachable Revisions, strict Skill extraction
+    # (symlink, path traversal, and `.git` refusal), safe `git` invocation,
+    # and license detection.
+    "src/source.rs",
+    "src/source/**/*.rs",
     # Update conflict handling.
     "src/conflict.rs",
     "src/conflict/**/*.rs",

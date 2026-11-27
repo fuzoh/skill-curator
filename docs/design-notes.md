@@ -188,3 +188,77 @@ the Rust types in `src/collection/` are the reference. Choices made there:
   its presets in order (not their names), and its intent bytes. It does not
   merge rules into their effective result, so renaming a preset keeps the
   hash, while moving a rule between a preset and the Skill changes it.
+
+### Source cache, extraction, and licenses
+
+Implemented in
+[System Git Source cache, Revision fetching, and license detection](https://github.com/fuzoh/skill-curator/issues/31);
+`src/source.rs` and `src/collection/attribution.rs` are the reference.
+Choices made there:
+
+- The cache lives in `$XDG_CACHE_HOME/skill-curator` (absolute values only),
+  else `~/.cache/skill-curator`. Each Source URL gets one bare repository,
+  `sources/<source>-<16 hex digits of the URL's SHA-256>.git`, so changing a
+  URL starts a new cache. The first use clones into a temporary directory
+  that is renamed into place once complete.
+- Every `git` call runs with `core.hooksPath=/dev/null`, `core.fsmonitor`
+  off, `protocol.ext.allow=never`, submodule recursion off, automatic
+  garbage collection and maintenance off, replace objects ignored, no
+  standard input, no template directory at clone time, and the environment
+  variables that redirect Git to another repository (`GIT_DIR`,
+  `GIT_INDEX_FILE`, `GIT_CONFIG_PARAMETERS`, ...) removed. The user's own
+  Git configuration still applies, so credentials and URL rewrites keep
+  working.
+- The candidate Revision is the tip of the Source's `branch`, or of the
+  remote `HEAD` when none is set, fetched without tags into one tracking
+  reference, so changing `branch` (even from `release` to `release/v2`)
+  never collides with an older tracking reference. Extracting a Revision
+  that is not cached fetches it by identifier. When the Source refuses (as
+  every protocol v0 or v1 server does for a commit that is not a branch
+  tip), every branch is fetched, with pruning, into private mirror
+  references; if no branch brings the Revision, the typed
+  `RevisionUnreachable` error lets callers fall back to a two-way
+  comparison. A Source that cannot be reached
+  (network, authentication) stays a plain `git fetch` failure, recognised
+  from Git's untranslated (`LC_ALL=C`) diagnostics, so a transient outage is
+  never mistaken for a history rewrite. Each extracted Revision is kept by a
+  private reference, and automatic garbage collection is off, so a Revision
+  fetched once survives a later upstream history rewrite.
+- Extraction never checks out a working tree, which also keeps Git
+  attributes and filters out of play: it lists the tree at the Revision
+  with `git ls-tree` and writes each blob with `git cat-file`. Every
+  symbolic link in the Skill directory is refused, not only those pointing
+  outside it, because materialised Skills hold regular files only; the
+  error says whether each link escapes. Submodules, unusual file modes,
+  non-UTF-8 paths, and paths with a `..`, `.`, empty, or `.git` (any letter
+  case) component are refused too, all listed in one error. Files land in a
+  fresh temporary directory, read-only (`0444`, or `0555` for executables),
+  removed when dropped.
+- `upstream_path` is a Skill only when it is a directory holding a
+  `SKILL.md`. Otherwise the error gives the reason and up to five
+  directories holding a regular `SKILL.md`, ranked by matching final name,
+  edit distance of that name, shared leading directories, and edit distance
+  of the whole path. Nothing is chosen automatically.
+- License files are regular files named `LICENSE`, `LICENCE`, `COPYING`, or
+  `UNLICENSE` (any case, optionally followed by `.`, `-`, or `_` and more
+  text) at the Source root, in each directory leading to the Skill (such as
+  `pstack/LICENSE` for `pstack/critique`), and in the Skill directory. The
+  summary is the file's `SPDX-License-Identifier` tag, else the GNU license
+  named first near the top of the text with the version right after it
+  (full GNU texts and the MPL-2.0 name other GNU licenses further down),
+  else the Apache-2.0 or MPL-2.0 title near the top, else the first match
+  among characteristic phrases of other common licenses, with exclusions
+  so that a text is never read as a laxer relative (MIT as MIT-0,
+  BSD-3-Clause as BSD-2-Clause), else absent. A text with restricted terms
+  (Business Source License, Commons Clause, "Good, not Evil", Server Side
+  Public License) is never summarised as the license it names or quotes. A
+  near miss stays unidentified rather than getting a wrong summary.
+  Regression tests run on full canonical texts. The warning fires when no
+  file is found or any found file is unidentified.
+- `ATTRIBUTION.md` is rendered from `lock.toml` alone: Skills by name,
+  provenance entries by Composition input, Source, and path, every value in
+  a code span that no lock value can break out of. It lists, per upstream
+  Skill or Composition input, the path, Source, URL, Revision, and license
+  files with their summary, or says that no license was found. It is written
+  atomically, replacing (never following) a symbolic link at its path.
+  License texts are not copied into it.

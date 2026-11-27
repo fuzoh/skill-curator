@@ -1,0 +1,17 @@
+License text copyright (c) 2020 MariaDB Corporation Ab, All Rights Reserved.
+"Business Source License" is a trademark of MariaDB Corporation Ab.
+
+Parameters
+
+Licensor:             Example Corp
+Licensed Work:        Example Tool. The Licensed Work is (c) 2026 Example Corp
+Additional Use Grant: You may make production use of the Licensed Work, provided
+                      Your use does not include offering the Licensed Work to
+                      third parties on a hosted or embedded basis.
+Change Date:          Four years from the date the Licensed Work is published.
+Change License:       Mozilla Public License, version 2.0
+
+Terms
+
+The Licensor hereby grants you the right to copy, modify, create derivative
+works, redistribute, and make non-production use of the Licensed Work.

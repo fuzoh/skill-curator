@@ -9,5 +9,6 @@ pub mod collection;
 mod error;
 pub mod hash;
 pub mod safety;
+pub mod source;
 
 pub use error::Error;

@@ -41,6 +41,12 @@ pub enum PathError {
     InvalidName,
     /// A name is longer than 64 characters.
     NameTooLong,
+    /// A path read from an upstream tree has an empty or `.` segment, so it
+    /// does not name an entry exactly.
+    DotSegment,
+    /// A path read from an upstream tree has a `.git` component, which Git
+    /// tools would read as repository metadata.
+    GitDir,
 }
 
 impl fmt::Display for PathError {
@@ -60,6 +66,8 @@ impl fmt::Display for PathError {
                 "it must start with a lowercase letter or digit and contain only `a-z`, `0-9`, `-`, and `_`"
             }
             Self::NameTooLong => "it must be at most 64 characters long",
+            Self::DotSegment => "it must not contain empty or `.` segments",
+            Self::GitDir => "it must not contain a `.git` component",
         };
         f.write_str(reason)
     }
@@ -219,6 +227,28 @@ impl RelativePath {
             return Ok(Self(".".to_owned()));
         }
         Ok(Self(segments.join("/")))
+    }
+
+    /// Validates a path read from an upstream Git tree, which must name an
+    /// entry exactly: on top of the checks of [`RelativePath::new`], it
+    /// rejects empty and `.` segments (including a trailing `/`) instead of
+    /// normalising them, and any `.git` component in any letter case.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PathError`] when `raw` fails [`RelativePath::new`], has an
+    /// empty or `.` segment, or a `.git` component.
+    pub fn exact(raw: &str) -> Result<Self, PathError> {
+        relative_segments(raw)?;
+        for segment in raw.split('/') {
+            if segment.is_empty() || segment == "." {
+                return Err(PathError::DotSegment);
+            }
+            if segment.eq_ignore_ascii_case(".git") {
+                return Err(PathError::GitDir);
+            }
+        }
+        Ok(Self(raw.to_owned()))
     }
 
     /// The normalised path.
@@ -502,6 +532,37 @@ mod tests {
         ];
         for (raw, expected) in cases {
             assert_eq!(RelativePath::new(raw), Err(expected), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn exact_paths_name_upstream_entries_verbatim() {
+        for raw in [
+            "SKILL.md",
+            "skills/grill-me/SKILL.md",
+            "a..b/c",
+            ".github/x",
+            ".gitignore",
+        ] {
+            assert_eq!(RelativePath::exact(raw).unwrap().as_str(), raw);
+        }
+        let cases = [
+            ("", PathError::Empty),
+            ("/etc/passwd", PathError::Absolute),
+            ("..", PathError::Traversal),
+            ("a/../b", PathError::Traversal),
+            ("a\\b", PathError::Backslash),
+            ("a\tb", PathError::ControlCharacter),
+            (".", PathError::DotSegment),
+            ("a/./b", PathError::DotSegment),
+            ("a//b", PathError::DotSegment),
+            ("a/", PathError::DotSegment),
+            (".git", PathError::GitDir),
+            ("a/.git/config", PathError::GitDir),
+            ("a/.GIT/hooks", PathError::GitDir),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(RelativePath::exact(raw), Err(expected), "{raw:?}");
         }
     }
 
