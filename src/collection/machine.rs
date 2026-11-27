@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::Problem;
-use super::manifest::{FrontmatterRules, Harness, Manifest};
+use super::manifest::{FrontmatterRules, Harness, Manifest, no_skills_dir_problem};
 use crate::safety::{HomeDir, InstallPath, Name, RelativePath};
 
 /// Parsed `machine.toml`. An absent file is the default: every Destination
@@ -131,13 +131,7 @@ impl MachineConfig {
                         .and_then(|default| InstallPath::new(default).ok())
                 });
             let Some(skills_dir) = skills_dir else {
-                problems.push(Problem::new(
-                    format!("destinations.{name}.skills_dir"),
-                    format!(
-                        "harness `{}` has no default Skills directory; set `skills_dir`",
-                        portable.harness.as_str()
-                    ),
-                ));
+                problems.push(no_skills_dir_problem(name, portable.harness));
                 continue;
             };
             let instructions = match (&portable.instructions, local.instruction_file) {

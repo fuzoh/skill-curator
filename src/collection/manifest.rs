@@ -535,16 +535,21 @@ fn check_under(at: &str, path: &RelativePath, dir: &str, problems: &mut Vec<Prob
     }
 }
 
+/// Destination `name` has no `skills_dir` and its harness has no default.
+pub(super) fn no_skills_dir_problem(name: &Name, harness: Harness) -> Problem {
+    Problem::new(
+        format!("destinations.{name}.skills_dir"),
+        format!(
+            "harness `{}` has no default Skills directory; set `skills_dir`",
+            harness.as_str()
+        ),
+    )
+}
+
 fn check_destination(name: &Name, destination: &Destination, problems: &mut Vec<Problem>) {
     let at = format!("destinations.{name}");
     if destination.skills_dir.is_none() && destination.harness.default_skills_dir().is_none() {
-        problems.push(Problem::new(
-            format!("{at}.skills_dir"),
-            format!(
-                "harness `{}` has no default Skills directory; set `skills_dir`",
-                destination.harness.as_str()
-            ),
-        ));
+        problems.push(no_skills_dir_problem(name, destination.harness));
     }
     if let Some(instructions) = &destination.instructions {
         let fragments_at = format!("{at}.instructions.fragments");

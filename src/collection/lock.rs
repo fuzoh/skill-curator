@@ -8,7 +8,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::Problem;
-use crate::hash::Digest;
+use crate::hash::{Digest, is_lower_hex};
 use crate::safety::{Name, RelativePath};
 
 /// Lock format written and read by this release.
@@ -98,11 +98,7 @@ impl Revision {
     /// hexadecimal digits. Abbreviated identifiers and branch names are not
     /// Revisions.
     pub fn new(raw: &str) -> Result<Self, InvalidRevision> {
-        let valid = matches!(raw.len(), 40 | 64)
-            && raw
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        if valid {
+        if matches!(raw.len(), 40 | 64) && is_lower_hex(raw) {
             Ok(Self(raw.to_owned()))
         } else {
             Err(InvalidRevision(raw.to_owned()))

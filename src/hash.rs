@@ -43,11 +43,7 @@ impl Digest {
     /// lowercase hexadecimal digits.
     pub fn parse(raw: &str) -> Result<Self, InvalidDigest> {
         let hex = raw.strip_prefix(SHA256_PREFIX).ok_or(InvalidDigest)?;
-        let valid = hex.len() == SHA256_HEX_LEN
-            && hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        if valid {
+        if hex.len() == SHA256_HEX_LEN && is_lower_hex(hex) {
             Ok(Self(raw.to_owned()))
         } else {
             Err(InvalidDigest)
@@ -70,6 +66,12 @@ impl Digest {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Whether every character of `text` is a lowercase hexadecimal digit.
+pub(crate) fn is_lower_hex(text: &str) -> bool {
+    text.bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn hex_digit(nibble: u8) -> char {
