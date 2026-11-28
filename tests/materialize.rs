@@ -763,6 +763,13 @@ fn file_rules_with_traversal_or_invalid_globs_are_rejected() -> TestResult {
                 "`refs/[a` is not a valid glob",
             ],
         ),
+        (
+            "./evals",
+            [
+                "\"./evals\" is not a valid path pattern",
+                "empty or `.` segments",
+            ],
+        ),
     ] {
         let fixture = Fixture::new()?;
         fixture.edit_manifest(

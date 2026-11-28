@@ -310,8 +310,11 @@ impl fmt::Display for RelativePath {
 /// A relative path glob (D2 `exclude` or `include` entry), kept verbatim.
 ///
 /// Glob syntax is interpreted by the file filter; this type only guarantees
-/// the pattern cannot name anything outside the Skill directory: it is not
-/// absolute and has no `..` segment.
+/// the pattern cannot name anything outside the Skill directory (it is not
+/// absolute and has no `..` segment) and is written the way the paths it is
+/// matched against are: without empty or `.` segments, so `./evals` and
+/// `evals//x` are refused rather than silently matching nothing. A single
+/// trailing `/` is kept: it restricts the pattern to directories.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct PathPattern(String);
@@ -322,7 +325,8 @@ impl PathPattern {
     /// # Errors
     ///
     /// Returns a [`PathError`] when `raw` is empty, absolute, contains a `..`
-    /// segment, or a control character.
+    /// segment, an empty or `.` segment other than one trailing `/`, or a
+    /// control character.
     pub fn new(raw: &str) -> Result<Self, PathError> {
         check_common(raw)?;
         if raw.starts_with('/') {
@@ -330,6 +334,13 @@ impl PathPattern {
         }
         if raw.split('/').any(|segment| segment == "..") {
             return Err(PathError::Traversal);
+        }
+        let body = raw.strip_suffix('/').unwrap_or(raw);
+        if body
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == ".")
+        {
+            return Err(PathError::DotSegment);
         }
         Ok(Self(raw.to_owned()))
     }
@@ -606,7 +617,15 @@ mod tests {
 
     #[test]
     fn patterns_keep_globs_but_reject_escapes() {
-        for raw in ["assets/**", "*.png", "**/automations", "docs/[ab].md"] {
+        for raw in [
+            "assets/**",
+            "*.png",
+            "**/automations",
+            "docs/[ab].md",
+            "evals/",
+            ".github",
+            "a/.hidden/*",
+        ] {
             assert_eq!(PathPattern::new(raw).unwrap().as_str(), raw);
         }
         let cases = [
@@ -616,6 +635,13 @@ mod tests {
             ("a/../b", PathError::Traversal),
             ("**/..", PathError::Traversal),
             ("a\tb", PathError::ControlCharacter),
+            ("./evals", PathError::DotSegment),
+            ("evals/.", PathError::DotSegment),
+            ("a/./b", PathError::DotSegment),
+            (".", PathError::DotSegment),
+            ("evals//", PathError::DotSegment),
+            ("a//b", PathError::DotSegment),
+            ("/", PathError::Absolute),
         ];
         for (raw, expected) in cases {
             assert_eq!(PathPattern::new(raw), Err(expected), "{raw:?}");
