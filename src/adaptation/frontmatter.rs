@@ -425,11 +425,16 @@ pub fn apply_rules(text: &str, rules: &[&FrontmatterRules]) -> Result<String, Fr
     if rules.iter().all(|rules| rules.is_empty()) {
         return Ok(text.to_owned());
     }
+    adapted(text, rules)?.render()
+}
+
+/// Parses `text` and applies the D1 rule sets to it, in order.
+fn adapted(text: &str, rules: &[&FrontmatterRules]) -> Result<SkillDocument, FrontmatterError> {
     let mut document = SkillDocument::parse(text)?;
     for rules in rules {
         document.apply(rules)?;
     }
-    document.render()
+    Ok(document)
 }
 
 /// Replays a change of D1 rules onto an accepted `SKILL.md` without
@@ -455,15 +460,8 @@ pub fn replay_rules(
 ) -> Result<String, FrontmatterError> {
     let mut document = SkillDocument::parse(accepted)?;
     if let Some(upstream) = upstream {
-        let under = |rules: &[&FrontmatterRules]| -> Result<SkillDocument, FrontmatterError> {
-            let mut document = SkillDocument::parse(upstream)?;
-            for rules in rules {
-                document.apply(rules)?;
-            }
-            Ok(document)
-        };
-        let before = under(old)?;
-        let after = under(new)?;
+        let before = adapted(upstream, old)?;
+        let after = adapted(upstream, new)?;
         let keys = before
             .entries()
             .iter()

@@ -30,13 +30,13 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::adaptation::files::FileFilter;
-use crate::adaptation::frontmatter::{apply_rules, replay_rules};
+use crate::adaptation::files::{FileFilter, FilesError};
+use crate::adaptation::frontmatter::{FrontmatterError, apply_rules, replay_rules};
 use crate::adaptation::{AdaptationError, Rules, SkillTree, det};
-use crate::collection::lock::{AppliedInputs, LockedSkill, Provenance, Revision};
-use crate::collection::manifest::{Skill, Source};
+use crate::collection::lock::{AppliedInputs, Lock, LockedSkill, Provenance, Revision};
+use crate::collection::manifest::{FrontmatterRules, Skill, Source};
 use crate::collection::{
     Collection, CollectionError, Entry, LOCK_FILE, SKILLS_DIR, attribution, inspect,
 };
@@ -221,14 +221,14 @@ impl From<AdaptationError> for MaterializeError {
     }
 }
 
-impl From<crate::adaptation::files::FilesError> for MaterializeError {
-    fn from(err: crate::adaptation::files::FilesError) -> Self {
+impl From<FilesError> for MaterializeError {
+    fn from(err: FilesError) -> Self {
         Self::Adaptation(err.into())
     }
 }
 
-impl From<crate::adaptation::frontmatter::FrontmatterError> for MaterializeError {
-    fn from(err: crate::adaptation::frontmatter::FrontmatterError) -> Self {
+impl From<FrontmatterError> for MaterializeError {
+    fn from(err: FrontmatterError) -> Self {
         Self::Adaptation(err.into())
     }
 }
@@ -555,7 +555,7 @@ enum OutputState {
 struct Run<'a> {
     collection: &'a Collection,
     cache: &'a SourceCache,
-    lock: crate::collection::lock::Lock,
+    lock: Lock,
 }
 
 impl Run<'_> {
@@ -618,24 +618,27 @@ impl Run<'_> {
         let Some(locked) = self.lock.skills.get(name) else {
             return Ok(Outcome::NotMaterialized);
         };
-        let digest = match self.output_state(name, &locked.output_hash)? {
+        let reason = match self.output_state(name, &locked.output_hash)? {
             OutputState::InSync => return Ok(Outcome::NothingToAccept),
-            OutputState::Changed(digest) => digest,
-            OutputState::Missing => {
-                return Err(MaterializeError::NothingToAccept {
-                    name: name.clone(),
-                    reason: format!("`{SKILLS_DIR}/{name}/` is missing"),
-                    resettable,
-                });
+            OutputState::Changed(digest) => {
+                return self.accept_edits(name, skill, digest);
             }
-            OutputState::Unhashable(reason) => {
-                return Err(MaterializeError::NothingToAccept {
-                    name: name.clone(),
-                    reason,
-                    resettable,
-                });
-            }
+            OutputState::Missing => format!("`{SKILLS_DIR}/{name}/` is missing"),
+            OutputState::Unhashable(reason) => reason,
         };
+        Err(MaterializeError::NothingToAccept {
+            name: name.clone(),
+            reason,
+            resettable,
+        })
+    }
+
+    fn accept_edits(
+        &mut self,
+        name: &Name,
+        skill: &Skill,
+        digest: Digest,
+    ) -> Result<Outcome, MaterializeError> {
         let tree = SkillTree::read(&self.collection.skill_dir(name))?;
         let text = tree.skill_md()?;
         // The edits are the user's to keep: a `SKILL.md` the D1 rules would
@@ -668,11 +671,7 @@ impl Run<'_> {
         let tree = det(&upstream, &Rules::of(self.collection.manifest(), skill))?;
         self.replace_skill(name, &tree)?;
         let intent = skill.intent().cloned();
-        let inputs_hash = if intent.is_some() {
-            self.collection.inputs_digest_without_intent(name)?
-        } else {
-            self.collection.inputs_digest(name)?
-        };
+        let inputs_hash = self.collection.inputs_digest_without_intent(name)?;
         let mut applied = self.collection.applied_inputs(name)?.unwrap_or_default();
         applied.intent_hash = None;
         let output_hash = self.collection.output_digest(name)?;
@@ -832,17 +831,12 @@ impl Run<'_> {
             }
         }
         if old.frontmatter != current.frontmatter {
-            let before = accepted.skill_md()?.to_owned();
-            let after = replay_rules(
-                &before,
+            changes.frontmatter = replay_frontmatter(
+                accepted,
                 Some(upstream.skill_md()?),
                 &old_rules.frontmatter,
                 &new_rules.frontmatter,
             )?;
-            if after != before {
-                accepted.set_skill_md(after);
-                changes.frontmatter = true;
-            }
         }
         Ok(Ok(changes))
     }
@@ -868,7 +862,7 @@ impl Run<'_> {
     fn replace_skill(&self, name: &Name, tree: &SkillTree) -> Result<(), MaterializeError> {
         let root = self.collection.root();
         let skills = root.join(SKILLS_DIR);
-        let write_error = |path: &std::path::Path| {
+        let write_error = |path: &Path| {
             let path = path.to_path_buf();
             move |source| MaterializeError::Write { path, source }
         };
@@ -920,21 +914,34 @@ fn replay_composition(
     old: &AppliedInputs,
     current: &AppliedInputs,
 ) -> Result<Changes, MaterializeError> {
-    let mut changes = Changes::default();
-    if old.frontmatter != current.frontmatter {
-        let before = accepted.skill_md()?.to_owned();
-        let after = replay_rules(
-            &before,
+    let frontmatter = old.frontmatter != current.frontmatter
+        && replay_frontmatter(
+            accepted,
             None,
             &rules_of(old).frontmatter,
             &rules_of(current).frontmatter,
         )?;
-        if after != before {
-            accepted.set_skill_md(after);
-            changes.frontmatter = true;
-        }
+    Ok(Changes {
+        frontmatter,
+        ..Changes::default()
+    })
+}
+
+/// Replays a change of D1 rules onto the accepted `SKILL.md`, restoring keys
+/// from the `upstream` `SKILL.md` when given. Returns whether it changed.
+fn replay_frontmatter(
+    accepted: &mut SkillTree,
+    upstream: Option<&str>,
+    old: &[&FrontmatterRules],
+    new: &[&FrontmatterRules],
+) -> Result<bool, MaterializeError> {
+    let before = accepted.skill_md()?;
+    let after = replay_rules(before, upstream, old, new)?;
+    let changed = after != before;
+    if changed {
+        accepted.set_skill_md(after);
     }
-    Ok(changes)
+    Ok(changed)
 }
 
 /// Whether `--reset` can rebuild `skill`: only Copy and Adapt Skills have a

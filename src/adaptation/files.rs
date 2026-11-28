@@ -176,12 +176,6 @@ impl FileFilter {
         self.stages.iter().find_map(|stage| stage.dropped(path))
     }
 
-    /// Whether the rules keep `path`.
-    #[must_use]
-    pub fn keeps(&self, path: &RelativePath) -> bool {
-        self.dropped(path).is_none()
-    }
-
     /// The paths of `files` the rules keep, which must include the Skill's
     /// top-level `SKILL.md`.
     ///

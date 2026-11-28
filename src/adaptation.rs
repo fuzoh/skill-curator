@@ -255,14 +255,14 @@ impl SkillTree {
     pub fn skill_md(&self) -> Result<&str, AdaptationError> {
         let file = self
             .files
-            .get(&skill_file_path())
+            .get(&RelativePath::skill_file())
             .ok_or(AdaptationError::Files(FilesError::MissingSkillFile))?;
         std::str::from_utf8(&file.contents).map_err(|_| AdaptationError::SkillFileNotUtf8)
     }
 
     /// Replaces the text of the top-level `SKILL.md`, keeping its mode.
     pub fn set_skill_md(&mut self, text: String) {
-        let path = skill_file_path();
+        let path = RelativePath::skill_file();
         let executable = self.files.get(&path).is_some_and(|file| file.executable);
         self.files.insert(
             path,
@@ -325,10 +325,6 @@ impl SkillTree {
         }
         Ok(())
     }
-}
-
-fn skill_file_path() -> RelativePath {
-    RelativePath::skill_file()
 }
 
 /// The deterministic rules of a Skill or Composition input, presets first,
