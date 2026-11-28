@@ -4,6 +4,7 @@
 //! The binary is a thin wrapper around [`cli::main`]; all behaviour lives in
 //! this library so it can be exercised by unit and integration tests.
 
+pub mod adaptation;
 pub mod cli;
 pub mod collection;
 mod error;

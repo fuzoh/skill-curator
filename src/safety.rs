@@ -10,6 +10,8 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::collection::SKILL_FILE;
+
 /// Maximum length of a [`Name`], matching the Agent Skills limit for Skill
 /// names.
 const MAX_NAME_LEN: usize = 64;
@@ -249,6 +251,12 @@ impl RelativePath {
             }
         }
         Ok(Self(raw.to_owned()))
+    }
+
+    /// The path of a Skill's `SKILL.md`, relative to the Skill directory.
+    #[must_use]
+    pub fn skill_file() -> Self {
+        Self(SKILL_FILE.to_owned())
     }
 
     /// The normalised path.
