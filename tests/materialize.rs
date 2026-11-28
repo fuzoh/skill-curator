@@ -1138,6 +1138,32 @@ fn manual_edits_on_a_composition_are_never_answered_with_a_reset() -> TestResult
 }
 
 #[test]
+fn a_newly_kept_file_never_overwrites_an_accepted_file_at_its_path() -> TestResult {
+    let fixture = Fixture::new()?;
+    fs::create_dir(fixture.skill("grilling").join("evals"))?;
+    fs::write(fixture.skill("grilling").join("evals/basic.md"), "Mine.\n")?;
+    fixture.materialize(&["--accept", "grilling"]).success();
+    fixture.edit_manifest(
+        GRILLING_RULES,
+        &GRILLING_RULES.replace("exclude = [\"evals\"]", "exclude = []"),
+    )?;
+    let before = files(&fixture.skill("grilling"))?;
+    let lock = fixture.lock_text()?;
+    fixture.delete_upstream()?;
+
+    fixture
+        .materialize(&[])
+        .code(FAILURE)
+        .stdout(predicate::str::contains(
+            "grilling: cannot replay the change: the file rules (D2) now keep `evals/basic.md`, but the accepted Skill already has a file there; run `skill-curator materialize --reset grilling` to rebuild it\n",
+        ));
+    assert_eq!(fixture.read("grilling", "evals/basic.md")?, "Mine.\n");
+    assert_eq!(files(&fixture.skill("grilling"))?, before);
+    assert_eq!(fixture.lock_text()?, lock);
+    Ok(())
+}
+
+#[test]
 fn a_lock_entry_without_applied_rules_blocks_the_replay() -> TestResult {
     let fixture = Fixture::new()?;
     let mut lock = fixture.lock()?;
@@ -1178,6 +1204,76 @@ fn a_lock_entry_without_applied_rules_blocks_the_replay() -> TestResult {
     fixture.materialize(&["--reset", "grilling"]).code(FAILURE);
     assert!(!fixture.read("grilling", "SKILL.md")?.contains("version:"));
     fixture.assert_lock_matches("grilling")?;
+    Ok(())
+}
+
+#[test]
+fn a_symbolic_link_in_place_of_skills_is_never_written_through() -> TestResult {
+    let fixture = Fixture::new()?;
+    // Without a local Skill, loading the Collection never looks inside
+    // `skills/`, so only the write path can refuse the link.
+    fixture.edit_manifest("\n[skills.notes]\nmode = \"local\"\n", "")?;
+    let outside = fixture.dir.path().join("outside");
+    let skills = fixture.collection().join("skills");
+    fs::rename(&skills, &outside)?;
+    symlink(&outside, &skills)?;
+    fs::write(outside.join("grilling/stray.md"), "Stray.\n")?;
+    let before = files(&outside)?;
+    let lock = fixture.lock_text()?;
+    fixture.delete_upstream()?;
+
+    fixture
+        .materialize(&["--reset", "grilling"])
+        .code(FAILURE)
+        .stdout(predicate::str::contains(format!(
+            "grilling: failed: {} must be a directory of the Collection, not a symbolic link or another kind of file\n",
+            skills.display()
+        )));
+    assert_eq!(files(&outside)?, before);
+    assert_eq!(
+        fs::read_to_string(outside.join("grilling/stray.md"))?,
+        "Stray.\n"
+    );
+    assert!(
+        fs::read_dir(&outside)?
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with('.')),
+        "a staging directory was created through the link"
+    );
+    assert!(fs::symlink_metadata(&skills)?.file_type().is_symlink());
+    assert_eq!(fixture.lock_text()?, lock);
+    Ok(())
+}
+
+#[test]
+fn a_symbolic_link_in_place_of_a_skill_is_replaced_not_followed() -> TestResult {
+    let fixture = Fixture::new()?;
+    let outside = fixture.dir.path().join("outside");
+    let skill = fixture.skill("grilling");
+    fs::rename(&skill, &outside)?;
+    fs::write(outside.join("SKILL.md"), "Outside the Collection.\n")?;
+    symlink(&outside, &skill)?;
+    let before = files(&outside)?;
+    fixture.delete_upstream()?;
+
+    fixture
+        .materialize(&[])
+        .code(FAILURE)
+        .stdout(predicate::str::contains(
+            "grilling: manual edits in skills/grilling/",
+        ));
+    fixture
+        .materialize(&["--reset", "grilling"])
+        .success()
+        .stdout(predicate::str::contains("grilling: reset skills/grilling/"));
+    assert!(fs::symlink_metadata(&skill)?.file_type().is_dir());
+    assert!(!fixture.read("grilling", "SKILL.md")?.contains("Outside"));
+    fixture.assert_lock_matches("grilling")?;
+    assert_eq!(files(&outside)?, before);
+    assert_eq!(
+        fs::read_to_string(outside.join("SKILL.md"))?,
+        "Outside the Collection.\n"
+    );
     Ok(())
 }
 
