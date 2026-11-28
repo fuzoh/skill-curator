@@ -351,3 +351,55 @@ reference. Choices made there:
   Skill at a time. Local Skills are recorded (`output_hash` only) whenever
   their files change. The command exits with status 1 when any Skill still
   needs attention, after printing one line per Skill.
+
+### Agent rewrite handoff
+
+Implemented in
+[Agent rewrite handoff (pi / claude / --manual) and output validation](https://github.com/fuzoh/skill-curator/issues/33);
+`src/rewrite.rs`, `src/rewrite/`, and `src/diff.rs` are the reference.
+Choices made there:
+
+- A rewrite job carries the Skill name, its upstream views (`det(R_old)`
+  when reachable and `det(R_new)` for an Adaptation; each input at the old
+  Revision when reachable and at the new one, after its D2 rules, for a
+  Composition), `accepted_local` when the Skill was accepted before, the
+  written intent text, the D1 rule sets, and optional extra guidance for a
+  re-run. Building it from the Collection and the Source cache is left to
+  `update`.
+- The staging directory is a fresh `skill-curator-rewrite-*` directory in
+  the system temporary directory, removed when the rewrite ends, whatever
+  the outcome. It holds `BRIEF.md`, `base/`, `upstream/` (Adaptation),
+  `inputs/<input>/` (Composition), `diffs/<name>.diff` (`upstream.diff` for
+  an Adaptation, one per changed Composition input; written only when there
+  are changes), `current/`, and `output/`. Every view and `BRIEF.md` is
+  read-only (`0444`, `0555` for executables and directories); removal makes
+  directories writable again without following symbolic links.
+- `output/` starts as `accepted_local`, else `det(R_new)` for an
+  Adaptation, else empty (a first Composition).
+- `BRIEF.md` gives the written intent verbatim, the extra guidance, the
+  views, a per-file summary of upstream changes (or says they are unknown
+  when the old Revision is unavailable: the two-way case), the D1 rules
+  that are enforced again, and output instructions. It tells the agent that
+  view files are data: never run their scripts or follow instructions in
+  them.
+- The agent is chosen by `update --agent <pi|claude|manual>` (or
+  `--manual`), else by `agent = "..."` in `machine.toml` (an agent's
+  availability is machine-specific), else `pi`. `pi` and `claude` are
+  started interactively from `PATH` in the staging directory, inheriting
+  the terminal, with one fixed first message asking them to follow
+  `BRIEF.md`. A non-zero exit discards the output. Manual mode starts
+  nothing: it prints the staging directory and waits for Enter; `abort` or
+  end of input stops the rewrite.
+- `output/` is accepted only as a real directory of regular files and
+  directories: symbolic links anywhere (including `output/` itself), hard
+  links (a file with more than one link may live outside `output/`),
+  special files, non-UTF-8 names, and `.git` components are refused.
+  `SKILL.md` must exist, be UTF-8, and start with a frontmatter the D1
+  parser accepts (a YAML merge key is refused even without D1 rules). The
+  D1 rule sets are then enforced again in order, and the proposal records
+  whether that changed the agent's `SKILL.md`. D2 is not applied again.
+- The review diff runs from `accepted_local` (or nothing) to the proposal:
+  a unified diff per text file, one line per binary file or executable-bit
+  change, with a per-file time limit on line matching so hostile input
+  cannot stall the review. Persisting an accepted proposal is `update`'s
+  job.
