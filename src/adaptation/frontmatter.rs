@@ -13,7 +13,11 @@
 //! parsing the result again: the edited frontmatter must hold exactly the
 //! expected entries, otherwise the edit is refused rather than risking a
 //! frontmatter that means something else.
+//!
+//! Lines end at `\r\n`, `\r`, or `\n`, the YAML line breaks, so entry
+//! lines always agree with the line numbers the YAML parser reports.
 
+use std::collections::HashMap;
 use std::fmt::{self, Write as _};
 
 use saphyr_parser::{Event, Parser, ScalarStyle, ScanError};
@@ -28,6 +32,10 @@ const BOM: char = '\u{feff}';
 /// frontmatter is shallow; the limit keeps hostile upstream text from
 /// exhausting the stack.
 const MAX_DEPTH: usize = 64;
+/// Most nodes a frontmatter may hold once its aliases are resolved. Aliases
+/// are resolved by copying the anchored node, so the limit keeps hostile
+/// upstream text (an alias of an alias of ...) from exhausting memory.
+const MAX_NODES: usize = 100_000;
 
 /// Why a `SKILL.md` frontmatter cannot be read or edited.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +70,12 @@ pub enum FrontmatterError {
         /// Line in `SKILL.md`, starting at 1.
         line: usize,
     },
+    /// The frontmatter holds more nodes than this tool accepts once its
+    /// aliases are resolved.
+    TooLarge {
+        /// Line in `SKILL.md`, starting at 1.
+        line: usize,
+    },
     /// Editing the frontmatter would change entries no rule touches, for
     /// example through anchors and aliases shared between entries.
     UnsafeEdit,
@@ -92,6 +106,10 @@ impl fmt::Display for FrontmatterError {
                 f,
                 "the frontmatter value on line {line} nests more than {MAX_DEPTH} levels deep"
             ),
+            Self::TooLarge { line } => write!(
+                f,
+                "the frontmatter holds more than {MAX_NODES} values once its aliases are resolved (line {line})"
+            ),
             Self::UnsafeEdit => f.write_str(
                 "the frontmatter cannot be edited without changing entries the rules do not touch (anchors or aliases shared between keys?)",
             ),
@@ -104,7 +122,9 @@ impl std::error::Error for FrontmatterError {}
 /// A parsed YAML node, compared by what it means to a YAML reader rather
 /// than by how it is written: quoting matters only between plain scalars,
 /// which YAML resolves to numbers, booleans, or null, and quoted or block
-/// scalars, which are always strings.
+/// scalars, which are always strings. Aliases are resolved to a copy of the
+/// node their anchor names, so an edit that makes an alias name another
+/// anchor changes the aliasing entry's value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Node {
     /// A scalar value.
@@ -120,8 +140,6 @@ pub enum Node {
     Sequence(Vec<Node>, Option<String>),
     /// A mapping, in written order.
     Mapping(Vec<(Node, Node)>, Option<String>),
-    /// An alias to an anchored node.
-    Alias,
 }
 
 /// One top-level frontmatter entry: its key and the lines it spans.
@@ -296,7 +314,7 @@ impl SkillDocument {
     /// the same key, or appends it. An existing entry with the same value is
     /// left as written.
     pub fn put(&mut self, mut entry: Entry) {
-        if !entry.text.ends_with('\n') {
+        if !entry.text.ends_with(['\n', '\r']) {
             entry.text.push_str(self.newline);
         }
         let newline = self.newline;
@@ -377,13 +395,18 @@ impl SkillDocument {
 }
 
 /// Applies D1 rule sets in order to the `SKILL.md` text. Returns the text
-/// unchanged, byte for byte, when no rule changes anything.
+/// unchanged, byte for byte, when no rule changes anything. Without rules
+/// (every rule set empty) the text is not parsed at all, so a Skill without
+/// D1 rules keeps a frontmatter this module cannot edit.
 ///
 /// # Errors
 ///
 /// Returns a [`FrontmatterError`] when the frontmatter cannot be read or
 /// edited safely.
 pub fn apply_rules(text: &str, rules: &[&FrontmatterRules]) -> Result<String, FrontmatterError> {
+    if rules.iter().all(|rules| rules.is_empty()) {
+        return Ok(text.to_owned());
+    }
     let mut document = SkillDocument::parse(text)?;
     for rules in rules {
         document.apply(rules)?;
@@ -466,26 +489,54 @@ fn newline_of(text: &str) -> &'static str {
 /// top-level entries.
 fn split_entries(yaml: &str) -> Result<(String, Vec<Entry>), FrontmatterError> {
     let keys = parse_top_level(yaml)?;
-    let lines = yaml.split_inclusive('\n').collect::<Vec<_>>();
+    let lines = yaml_lines(yaml);
     let mut starts = keys.iter().map(|(_, line, _)| *line).collect::<Vec<_>>();
-    if starts.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(FrontmatterError::UnsupportedKey {
-            line: frontmatter_line(starts.last().copied().unwrap_or(1)),
-        });
+    // Key lines must increase and fall within the text; anything else means
+    // the parser and this split disagree, and the entries cannot be cut.
+    let unsupported = |line: usize| FrontmatterError::UnsupportedKey {
+        line: frontmatter_line(line),
+    };
+    if let Some(pair) = starts.windows(2).find(|pair| pair[0] >= pair[1]) {
+        return Err(unsupported(pair[1]));
+    }
+    if let Some(&line) = starts.iter().find(|&&line| line == 0 || line > lines.len()) {
+        return Err(unsupported(line));
     }
     let first = starts.first().copied().unwrap_or(lines.len() + 1);
-    let preamble = lines[..first - 1].concat();
+    let preamble = lines
+        .get(..first - 1)
+        .ok_or_else(|| unsupported(first))?
+        .concat();
     starts.push(lines.len() + 1);
     let entries = keys
         .into_iter()
         .zip(starts.windows(2))
-        .map(|((key, _, value), range)| Entry {
-            key,
-            text: lines[range[0] - 1..range[1] - 1].concat(),
-            value,
+        .map(|((key, line, value), range)| {
+            let text = lines
+                .get(range[0] - 1..range[1] - 1)
+                .ok_or_else(|| unsupported(line))?
+                .concat();
+            Ok(Entry { key, text, value })
         })
-        .collect();
+        .collect::<Result<_, FrontmatterError>>()?;
     Ok((preamble, entries))
+}
+
+/// Splits `yaml` into lines, each with its line break, ending lines at
+/// `\r\n`, `\r`, or `\n` as the YAML parser does.
+fn yaml_lines(yaml: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut rest = yaml;
+    while let Some(at) = rest.find(['\r', '\n']) {
+        let len = if rest[at..].starts_with("\r\n") { 2 } else { 1 };
+        let (line, after) = rest.split_at(at + len);
+        lines.push(line);
+        rest = after;
+    }
+    if !rest.is_empty() {
+        lines.push(rest);
+    }
+    lines
 }
 
 /// Line number in `SKILL.md` of line `line` of the frontmatter YAML, which
@@ -500,6 +551,8 @@ fn frontmatter_line(line: usize) -> usize {
 fn parse_top_level(yaml: &str) -> Result<Vec<(String, usize, Node)>, FrontmatterError> {
     let mut events = Events {
         parser: Parser::new_from_str(yaml),
+        anchors: HashMap::new(),
+        nodes: 0,
     };
     if events.next()?.0 != Event::StreamStart {
         return Err(FrontmatterError::NotAMapping);
@@ -529,7 +582,16 @@ fn top_level_entries(
         let (event, line, col) = events.next()?;
         let key = match event {
             Event::MappingEnd => return Ok(entries),
-            Event::Scalar(value, _, _, _) if col == 0 => value.into_owned(),
+            Event::Scalar(value, style, anchor, tag) if col == 0 => {
+                let key = value.into_owned();
+                let node = Node::Scalar {
+                    value: key.clone(),
+                    plain: style == ScalarStyle::Plain,
+                    tag: tag.map(|tag| tag.to_string()),
+                };
+                events.add_node(&node, line, anchor, 1)?;
+                key
+            }
             _ => {
                 return Err(FrontmatterError::UnsupportedKey {
                     line: frontmatter_line(line),
@@ -544,9 +606,16 @@ fn top_level_entries(
     }
 }
 
-/// The parser's events, with errors mapped to [`FrontmatterError`].
+/// The parser's events, with errors mapped to [`FrontmatterError`], and the
+/// anchored nodes seen so far, by anchor id.
 struct Events<'input> {
     parser: Parser<'input, saphyr_parser::StrInput<'input>>,
+    /// Each anchored node and its size in nodes. The parser gives every
+    /// anchor definition its own id, so a redefined anchor name gets a new
+    /// entry and later aliases resolve to it.
+    anchors: HashMap<usize, (Node, usize)>,
+    /// Nodes built so far, aliases counted at their resolved size.
+    nodes: usize,
 }
 
 impl<'input> Events<'input> {
@@ -560,7 +629,29 @@ impl<'input> Events<'input> {
         }
     }
 
-    /// Reads one complete node, starting with the next event.
+    /// Counts `size` more nodes, and records `node` under `anchor` when it
+    /// has one (anchor id 0 means none).
+    fn add_node(
+        &mut self,
+        node: &Node,
+        line: usize,
+        anchor: usize,
+        size: usize,
+    ) -> Result<(), FrontmatterError> {
+        self.nodes = self.nodes.saturating_add(size);
+        if self.nodes > MAX_NODES {
+            return Err(FrontmatterError::TooLarge {
+                line: frontmatter_line(line),
+            });
+        }
+        if anchor != 0 {
+            self.anchors.insert(anchor, (node.clone(), size));
+        }
+        Ok(())
+    }
+
+    /// Reads one complete node, starting with the next event, with its
+    /// aliases resolved.
     fn node(&mut self, depth: usize) -> Result<Node, FrontmatterError> {
         let (event, line, _) = self.next()?;
         if depth > MAX_DEPTH {
@@ -568,40 +659,67 @@ impl<'input> Events<'input> {
                 line: frontmatter_line(line),
             });
         }
-        match event {
-            Event::Scalar(value, style, _, tag) => Ok(Node::Scalar {
-                value: value.into_owned(),
-                plain: style == ScalarStyle::Plain,
-                tag: tag.map(|tag| tag.to_string()),
-            }),
-            Event::Alias(_) => Ok(Node::Alias),
-            Event::SequenceStart(_, tag) => {
+        let before = self.nodes;
+        let (node, anchor) = match event {
+            Event::Scalar(value, style, anchor, tag) => (
+                Node::Scalar {
+                    value: value.into_owned(),
+                    plain: style == ScalarStyle::Plain,
+                    tag: tag.map(|tag| tag.to_string()),
+                },
+                anchor,
+            ),
+            Event::Alias(anchor) => {
+                // An alias inside the node its anchor names (a recursive
+                // alias) has no complete target yet.
+                let Some((target, size)) = self.anchors.get(&anchor).cloned() else {
+                    return Err(FrontmatterError::Syntax {
+                        line: frontmatter_line(line),
+                        message: "an alias refers to a node that contains it".to_owned(),
+                    });
+                };
+                self.add_node(&target, line, 0, size)?;
+                return Ok(target);
+            }
+            Event::SequenceStart(anchor, tag) => {
                 let mut items = Vec::new();
                 loop {
                     if matches!(self.parser.peek(), Some(Ok((Event::SequenceEnd, _)))) {
                         self.next()?;
-                        return Ok(Node::Sequence(items, tag.map(|tag| tag.to_string())));
+                        break;
                     }
                     items.push(self.node(depth + 1)?);
                 }
+                (
+                    Node::Sequence(items, tag.map(|tag| tag.to_string())),
+                    anchor,
+                )
             }
-            Event::MappingStart(_, tag) => {
+            Event::MappingStart(anchor, tag) => {
                 let mut pairs = Vec::new();
                 loop {
                     if matches!(self.parser.peek(), Some(Ok((Event::MappingEnd, _)))) {
                         self.next()?;
-                        return Ok(Node::Mapping(pairs, tag.map(|tag| tag.to_string())));
+                        break;
                     }
                     let key = self.node(depth + 1)?;
                     let value = self.node(depth + 1)?;
                     pairs.push((key, value));
                 }
+                (Node::Mapping(pairs, tag.map(|tag| tag.to_string())), anchor)
             }
-            _ => Err(FrontmatterError::Syntax {
-                line: frontmatter_line(line),
-                message: "unexpected YAML structure".to_owned(),
-            }),
-        }
+            _ => {
+                return Err(FrontmatterError::Syntax {
+                    line: frontmatter_line(line),
+                    message: "unexpected YAML structure".to_owned(),
+                });
+            }
+        };
+        // The node itself, plus the nodes its children added.
+        let size = self.nodes - before + 1;
+        self.nodes = before;
+        self.add_node(&node, line, anchor, size)?;
+        Ok(node)
     }
 }
 
@@ -1014,6 +1132,95 @@ mod tests {
             apply_rules(&original, &[&rules(&[], &["base"], None)]),
             Err(FrontmatterError::UnsafeEdit)
         );
+    }
+
+    #[test]
+    fn an_edit_that_makes_an_alias_name_another_anchor_is_refused() {
+        // `b` names the second `&x`; removing it would make `b` name the
+        // first one, changing `b` from `two` to `one`.
+        let original = skill("a: &x one\nc: &x two\nb: *x\n");
+        assert_eq!(
+            apply_rules(&original, &[&rules(&[], &["c"], None)]),
+            Err(FrontmatterError::UnsafeEdit)
+        );
+        // Aliases mean the node they name: an untouched alias whose anchor
+        // stays is kept.
+        let document = SkillDocument::parse(&skill("a: &x [1, 2]\nb: *x\nc: 3\n")).unwrap();
+        assert_eq!(
+            document.entry("b").unwrap().value(),
+            document.entry("a").unwrap().value()
+        );
+        assert_eq!(
+            apply_rules(
+                &skill("a: &x [1, 2]\nb: *x\nc: 3\n"),
+                &[&rules(&[], &["c"], None)]
+            )
+            .unwrap(),
+            skill("a: &x [1, 2]\nb: *x\n")
+        );
+    }
+
+    #[test]
+    fn aliases_that_expand_too_far_are_refused() {
+        // Each level doubles the previous one: resolving every alias would
+        // need 2^40 nodes.
+        let mut frontmatter = "l0: &l0 [x, x]\n".to_owned();
+        for level in 1..=40 {
+            let previous = level - 1;
+            frontmatter.push_str(&format!(
+                "l{level}: &l{level} [*l{previous}, *l{previous}]\n"
+            ));
+        }
+        assert!(matches!(
+            SkillDocument::parse(&skill(&frontmatter)),
+            Err(FrontmatterError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn a_lone_carriage_return_ends_a_line_as_in_yaml() {
+        let original = "---\na: 1\rb: 2\rc: 3\n---\nbody\n";
+        let document = SkillDocument::parse(original).unwrap();
+        let keys = document
+            .entries()
+            .iter()
+            .map(Entry::key)
+            .collect::<Vec<_>>();
+        assert_eq!(keys, ["a", "b", "c"]);
+        assert_eq!(
+            apply_rules(original, &[&rules(&[], &["b"], None)]).unwrap(),
+            "---\na: 1\rc: 3\n---\nbody\n"
+        );
+        let original = "---\nx: 0\na: 1\rb: 2\rc: 3\nd: 4\n---\nbody\n";
+        assert_eq!(
+            apply_rules(original, &[&rules(&[], &["a", "d"], None)]).unwrap(),
+            "---\nx: 0\nb: 2\rc: 3\n---\nbody\n"
+        );
+        let crlf_mix = "---\r\na: 1\r\rb: 2\r\n---\r\nbody\r\n";
+        assert_eq!(
+            apply_rules(crlf_mix, &[&rules(&[], &["a"], None)]).unwrap(),
+            "---\r\nb: 2\r\n---\r\nbody\r\n"
+        );
+    }
+
+    #[test]
+    fn yaml_lines_end_at_every_yaml_line_break() {
+        assert_eq!(
+            yaml_lines("a\nb\r\nc\rd\r\r\ne"),
+            ["a\n", "b\r\n", "c\r", "d\r", "\r\n", "e"]
+        );
+        assert!(yaml_lines("").is_empty());
+    }
+
+    #[test]
+    fn without_rules_the_frontmatter_is_not_parsed() {
+        // Not something this module can edit: a plain scalar holding `: `.
+        let lax = "---\nname: x\ndescription: Use when: the user asks\n---\nbody\n";
+        assert!(SkillDocument::parse(lax).is_err());
+        assert_eq!(apply_rules(lax, &[]).unwrap(), lax);
+        let empty = FrontmatterRules::default();
+        assert_eq!(apply_rules(lax, &[&empty, &empty]).unwrap(), lax);
+        assert!(apply_rules(lax, &[&rules(&[], &["absent"], None)]).is_err());
     }
 
     #[test]

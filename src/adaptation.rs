@@ -556,6 +556,24 @@ frontmatter = { set = { license = "MIT" } }
     }
 
     #[test]
+    fn det_without_frontmatter_rules_keeps_a_frontmatter_d1_cannot_edit() {
+        let dir = upstream();
+        let lax = "---\nname: grill-me\ndescription: Use when: the user asks\n---\nBody\n";
+        write(dir.path(), "SKILL.md", lax);
+        let upstream = SkillTree::read(dir.path()).unwrap();
+        assert_eq!(det(&upstream, &Rules::default()).unwrap(), upstream);
+        let exclude = FileRules {
+            exclude: vec![PathPattern::new("evals").unwrap()],
+            include: None,
+        };
+        let rules = Rules {
+            files: vec![&exclude],
+            frontmatter: Vec::new(),
+        };
+        assert_eq!(det(&upstream, &rules).unwrap().skill_md().unwrap(), lax);
+    }
+
+    #[test]
     fn det_refuses_rules_that_drop_skill_md() {
         let dir = upstream();
         let exclude = FileRules {
