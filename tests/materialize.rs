@@ -646,6 +646,7 @@ fn accept_records_manual_edits_and_then_replays_on_top_of_them() -> TestResult {
         .stdout(predicate::str::contains(
             "voiced: accepted the manual edits in skills/voiced/ into lock.toml; update the written intent `intents/voiced.md`",
         ))
+        .stdout(predicate::str::contains("warning").not())
         .stdout(predicate::str::contains("voiced: removed `references/guide.md`"));
     assert_eq!(fixture.read("voiced", "SKILL.md")?, edited);
     assert_eq!(fixture.read("voiced", "NOTES.md")?, "Mine.\n");
@@ -825,6 +826,10 @@ fn options_naming_unknown_or_unresettable_skills_are_refused() -> TestResult {
             vec!["--reset", "notes"],
             "a local Skill has no deterministic",
         ),
+        (
+            vec!["--accept", "notes"],
+            "Skill `notes` is a local Skill: `materialize` records its files in lock.toml on every run, so there is nothing to accept",
+        ),
     ] {
         fixture
             .materialize(&args)
@@ -899,5 +904,199 @@ fn removing_the_written_intent_of_an_agent_rewrite_needs_a_reset() -> TestResult
     assert!(!fixture.read("voiced", "SKILL.md")?.contains(AGENT_LINE));
     fixture.assert_lock_matches("voiced")?;
     fixture.materialize(&[]).success();
+    Ok(())
+}
+
+#[test]
+fn include_globs_are_replayed_without_fetching() -> TestResult {
+    let fixture = Fixture::new()?;
+    for rules in [GRILLING_RULES, VOICED_RULES] {
+        fixture.edit_manifest(
+            rules,
+            &rules.replace(
+                "exclude = [\"evals\"]",
+                "exclude = [\"evals\"], include = [\"SKILL.md\", \"references\"]",
+            ),
+        )?;
+    }
+    let voiced_skill_md = fixture.read("voiced", "SKILL.md")?;
+    fixture.delete_upstream()?;
+
+    fixture
+        .materialize(&[])
+        .success()
+        .stdout(predicate::str::contains("grilling: rebuilt"))
+        .stdout(predicate::str::contains(
+            "voiced: removed `README.md`, `scripts/run.sh` at the pinned Revision",
+        ));
+    let kept = ["SKILL.md", "references/guide.md"];
+    assert_eq!(files(&fixture.skill("grilling"))?, kept);
+    assert_eq!(files(&fixture.skill("voiced"))?, kept);
+    assert_eq!(fixture.read("voiced", "SKILL.md")?, voiced_skill_md);
+    fixture.assert_lock_matches("grilling")?;
+    fixture.assert_lock_matches("voiced")?;
+    let lock = fixture.lock()?;
+    let applied = lock
+        .skills
+        .get(&name("grilling")?)
+        .and_then(|locked| locked.applied.as_ref())
+        .ok_or("no applied rules")?;
+    let include = applied
+        .files
+        .iter()
+        .find_map(|rules| rules.include.as_ref())
+        .ok_or("include not recorded")?;
+    assert_eq!(
+        include.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+        ["SKILL.md", "references"]
+    );
+
+    let before = fixture.lock_text()?;
+    fixture
+        .materialize(&[])
+        .success()
+        .stdout(predicate::str::contains("grilling: unchanged"))
+        .stdout(predicate::str::contains("voiced: unchanged"));
+    assert_eq!(fixture.lock_text()?, before);
+
+    // An `include` list that leaves out `SKILL.md` fails and changes nothing.
+    fixture.edit_manifest(
+        "include = [\"SKILL.md\", \"references\"]",
+        "include = [\"references\"]",
+    )?;
+    fixture
+        .materialize(&[])
+        .code(FAILURE)
+        .stdout(predicate::str::contains(
+            "grilling: failed: the file rules (D2) drop `SKILL.md`, which every Skill must keep: no `include` pattern selects it",
+        ));
+    assert_eq!(files(&fixture.skill("grilling"))?, kept);
+    assert_eq!(fixture.lock_text()?, before);
+    Ok(())
+}
+
+#[test]
+fn reset_never_hides_a_changed_upstream_path() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.edit_manifest(
+        GRILLING_RULES,
+        &GRILLING_RULES.replace("skills/grill-me", "skills/partner"),
+    )?;
+    fs::write(fixture.skill("grilling").join("stray.md"), "Stray.\n")?;
+    let before = files(&fixture.skill("grilling"))?;
+    let lock = fixture.lock_text()?;
+    fixture.delete_upstream()?;
+
+    let needs_update = "grilling: the declared upstream Skill (Source or upstream path) differs from the one pinned in lock.toml; run `skill-curator update`";
+    fixture
+        .materialize(&["--reset", "grilling"])
+        .code(FAILURE)
+        .stdout(predicate::str::contains(needs_update))
+        .stdout(predicate::str::contains("grilling: reset").not());
+    assert_eq!(files(&fixture.skill("grilling"))?, before);
+    assert_eq!(fixture.lock_text()?, lock);
+
+    // The next run still asks for `update`, once the manual edit is gone.
+    fs::remove_file(fixture.skill("grilling").join("stray.md"))?;
+    fixture
+        .materialize(&[])
+        .code(FAILURE)
+        .stdout(predicate::str::contains(needs_update));
+    assert_eq!(fixture.lock_text()?, lock);
+    Ok(())
+}
+
+#[test]
+fn an_agent_assisted_skill_equal_to_its_deterministic_adaptation_still_needs_an_agent_for_new_files()
+-> TestResult {
+    let fixture = Fixture::new()?;
+    // The agent rewrite of `voiced` changed nothing: its files are `det(R)`,
+    // but its written intent is recorded as applied.
+    let skill_md = fixture.read("voiced", "SKILL.md")?;
+    let deterministic = skill_md.strip_suffix(AGENT_LINE).ok_or("no agent line")?;
+    fs::write(fixture.skill("voiced").join("SKILL.md"), deterministic)?;
+    fixture.materialize(&["--accept", "voiced"]).success();
+    assert_eq!(
+        fixture.read("voiced", "SKILL.md")?,
+        fixture.read("grilling", "SKILL.md")?
+    );
+
+    fixture.edit_manifest(
+        VOICED_RULES,
+        &VOICED_RULES.replace("exclude = [\"evals\"]", "exclude = []"),
+    )?;
+    let before = files(&fixture.skill("voiced"))?;
+    let lock = fixture.lock_text()?;
+    fixture.delete_upstream()?;
+    fixture
+        .materialize(&[])
+        .code(FAILURE)
+        .stdout(predicate::str::contains(
+            "voiced: needs an agent rewrite: the file rules (D2) now keep files the agent rewrite has not seen: `evals/basic.md`",
+        ));
+    assert_eq!(files(&fixture.skill("voiced"))?, before);
+    assert_eq!(fixture.lock_text()?, lock);
+    Ok(())
+}
+
+#[test]
+fn accepting_edits_that_break_the_frontmatter_rules_warns() -> TestResult {
+    let fixture = Fixture::new()?;
+    // `grilling` removes `icon`; the edit brings it back.
+    let edited = fixture.read("grilling", "SKILL.md")?.replacen(
+        "version: 1\n",
+        "version: 1\nicon: flame\n",
+        1,
+    );
+    fs::write(fixture.skill("grilling").join("SKILL.md"), &edited)?;
+    fixture.delete_upstream()?;
+    fixture
+        .materialize(&["--accept", "grilling"])
+        .success()
+        .stdout(predicate::str::contains(
+            "grilling: accepted the manual edits in skills/grilling/ into lock.toml; warning: SKILL.md no longer satisfies the Skill's frontmatter rules (D1)",
+        ))
+        .stdout(predicate::str::contains("grilling: unchanged"));
+    assert_eq!(fixture.read("grilling", "SKILL.md")?, edited);
+    fixture.assert_lock_matches("grilling")?;
+    Ok(())
+}
+
+#[test]
+fn frontmatter_the_rules_cannot_edit_is_accepted_and_kept() -> TestResult {
+    let fixture = Fixture::new()?;
+    // Valid for many YAML readers, but not for D1: a plain scalar with `: `.
+    let lax = |text: String| {
+        text.replacen(
+            "description: Grill the user.",
+            "description: Use when: the user asks",
+            1,
+        )
+    };
+    let copy = lax(fixture.read("grill-me", "SKILL.md")?);
+    fs::write(fixture.skill("grill-me").join("SKILL.md"), &copy)?;
+    let adapted = lax(fixture.read("grilling", "SKILL.md")?);
+    fs::write(fixture.skill("grilling").join("SKILL.md"), &adapted)?;
+    fixture.delete_upstream()?;
+
+    // A Copy Skill has no D1 rules: nothing to warn about.
+    fixture
+        .materialize(&["--accept", "grill-me", "--accept", "grilling"])
+        .success()
+        .stdout(predicate::str::contains(
+            "grill-me: accepted the manual edits in skills/grill-me/ into lock.toml\n",
+        ))
+        .stdout(predicate::str::contains(
+            "grilling: accepted the manual edits in skills/grilling/ into lock.toml; warning: SKILL.md no longer satisfies the Skill's frontmatter rules (D1)",
+        ));
+    assert_eq!(fixture.read("grill-me", "SKILL.md")?, copy);
+    assert_eq!(fixture.read("grilling", "SKILL.md")?, adapted);
+    fixture.assert_lock_matches("grill-me")?;
+    fixture.assert_lock_matches("grilling")?;
+    fixture.materialize(&[]).success();
+
+    // A reset still rebuilds the Copy Skill from the pinned Revision.
+    fixture.materialize(&["--reset", "grill-me"]).success();
+    assert_eq!(fixture.read("grill-me", "SKILL.md")?, UPSTREAM_SKILL_MD);
     Ok(())
 }

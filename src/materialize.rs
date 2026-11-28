@@ -16,7 +16,10 @@
 //!   agent; files newly kept by D2 are added from the pinned Revision unless
 //!   the Skill is agent-assisted. Newly kept files and written intent
 //!   changes on agent-assisted Skills (Adapt Skills with an intent, and
-//!   Compositions) need an agent rewrite and are reported instead.
+//!   Compositions) need an agent rewrite and are reported instead, even when
+//!   the accepted Skill still equals its deterministic adaptation.
+//! - **A changed Source or upstream path** needs `update`; neither a replay
+//!   nor a reset rebuilds the Skill from another upstream Skill.
 //!
 //! The pinned Revision is read from the Source cache only; a Revision the
 //! cache lacks is an error, never a fetch. Each Skill is written to a
@@ -30,7 +33,7 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::adaptation::files::FileFilter;
-use crate::adaptation::frontmatter::{SkillDocument, apply_rules, replay_rules};
+use crate::adaptation::frontmatter::{apply_rules, replay_rules};
 use crate::adaptation::{AdaptationError, Rules, SkillTree, det};
 use crate::collection::lock::{AppliedInputs, LockedSkill, Provenance, Revision};
 use crate::collection::manifest::{Skill, Source};
@@ -66,6 +69,12 @@ pub enum MaterializeError {
     },
     /// A Skill is named both to accept and to reset.
     AcceptAndReset {
+        /// The Skill.
+        name: Name,
+    },
+    /// `--accept` was given for a local Skill, whose files `materialize`
+    /// records on every run.
+    AcceptLocal {
         /// The Skill.
         name: Name,
     },
@@ -132,6 +141,10 @@ impl fmt::Display for MaterializeError {
             Self::AcceptAndReset { name } => write!(
                 f,
                 "Skill `{name}` is named with both `--accept` and `--reset`; choose one"
+            ),
+            Self::AcceptLocal { name } => write!(
+                f,
+                "Skill `{name}` is a local Skill: `materialize` records its files in {LOCK_FILE} on every run, so there is nothing to accept; drop `--accept {name}`"
             ),
             Self::NoDeterministicState { name, mode } => write!(
                 f,
@@ -246,7 +259,8 @@ pub enum Outcome {
     Accepted {
         /// The Skill's written intent, which should now describe the edits.
         intent: Option<RelativePath>,
-        /// Whether the edited `SKILL.md` breaks the Skill's D1 rules.
+        /// Whether the edited `SKILL.md` breaks the Skill's D1 rules, or has
+        /// a frontmatter they cannot be applied to.
         breaks_frontmatter_rules: bool,
     },
     /// `--accept` was given but the Skill has no manual edits.
@@ -462,6 +476,11 @@ fn check_options(collection: &Collection, options: &Options) -> Result<(), Mater
             return Err(MaterializeError::UnknownSkill { name: name.clone() });
         }
     }
+    for name in &options.accept {
+        if let Some(Skill::Local(_)) = skills.get(name) {
+            return Err(MaterializeError::AcceptLocal { name: name.clone() });
+        }
+    }
     for name in &options.reset {
         if options.accept.contains(name) {
             return Err(MaterializeError::AcceptAndReset { name: name.clone() });
@@ -567,9 +586,12 @@ impl Run<'_> {
         };
         let tree = SkillTree::read(&self.collection.skill_dir(name))?;
         let text = tree.skill_md()?;
-        SkillDocument::parse(text)?;
+        // The edits are the user's to keep: a `SKILL.md` the D1 rules would
+        // change, or whose frontmatter they cannot be applied to, is accepted
+        // with a warning. Without D1 rules its frontmatter is not parsed.
         let rules = Rules::of(self.collection.manifest(), skill);
-        let breaks_frontmatter_rules = apply_rules(text, &rules.frontmatter)? != text;
+        let breaks_frontmatter_rules =
+            !apply_rules(text, &rules.frontmatter).is_ok_and(|applied| applied == text);
         if let Some(locked) = self.lock.skills.get_mut(name) {
             locked.output_hash = digest;
         }
@@ -584,6 +606,11 @@ impl Run<'_> {
         let Some(locked) = self.lock.skills.get(name) else {
             return Ok(Outcome::NotMaterialized);
         };
+        // The pinned Revision holds the old upstream Skill; rebuilding it and
+        // recording the current declaration would hide the change for good.
+        if let Some(reason) = identity_change(skill, &locked.provenance) {
+            return Ok(Outcome::NeedsUpdate { reason });
+        }
         let provenance = single_provenance(name, locked)?.clone();
         let upstream = self.upstream(&provenance)?;
         let tree = det(&upstream, &Rules::of(self.collection.manifest(), skill))?;
@@ -704,6 +731,20 @@ impl Run<'_> {
         let upstream = self.upstream(provenance)?;
         let old_rules = rules_of(old);
         let new_rules = rules_of(current);
+        let old_kept = FileFilter::new(&old_rules.files)?.select(upstream.paths())?;
+        let new_kept = FileFilter::new(&new_rules.files)?.select(upstream.paths())?;
+        let added = new_kept.difference(&old_kept).cloned().collect::<Vec<_>>();
+        // Checked before the rebuild below: an agent-assisted Skill whose
+        // rewrite left it equal to `det(R)` still never saw the new files,
+        // and its recorded intent would claim otherwise.
+        if agent && !added.is_empty() {
+            return Ok(Err(Outcome::NeedsAgent {
+                reason: format!(
+                    "the file rules (D2) now keep files the agent rewrite has not seen: {}",
+                    list(&added)
+                ),
+            }));
+        }
         // Still exactly the deterministic adaptation: rebuild it, so the
         // result is the same as a fresh `det(R)`.
         if det(&upstream, &old_rules)? == *accepted {
@@ -712,38 +753,22 @@ impl Run<'_> {
             *accepted = rebuilt;
             return Ok(Ok(changes));
         }
-        if old.files != current.files {
-            let old_kept = FileFilter::new(&old_rules.files)?.select(upstream.paths())?;
-            let new_kept = FileFilter::new(&new_rules.files)?.select(upstream.paths())?;
-            let added = new_kept.difference(&old_kept).collect::<Vec<_>>();
-            if !added.is_empty() {
-                if agent {
-                    return Ok(Err(Outcome::NeedsAgent {
-                        reason: format!(
-                            "the file rules (D2) now keep files the agent rewrite has not seen: {}",
-                            list(&added.into_iter().cloned().collect::<Vec<_>>())
-                        ),
-                    }));
-                }
-                for path in added {
-                    if accepted.get(path).is_some() {
-                        return Ok(Err(Outcome::Blocked {
-                            reason: format!(
-                                "the file rules (D2) now keep `{path}`, but the accepted Skill already has a file there"
-                            ),
-                        }));
-                    }
-                    if let Some(file) = upstream.get(path) {
-                        accepted.insert(path.clone(), file.clone());
-                        changes.added.push(path.clone());
-                    }
-                }
+        for path in added {
+            if accepted.get(&path).is_some() {
+                return Ok(Err(Outcome::Blocked {
+                    reason: format!(
+                        "the file rules (D2) now keep `{path}`, but the accepted Skill already has a file there"
+                    ),
+                }));
             }
-            let removed = old_kept.difference(&new_kept).collect::<BTreeSet<_>>();
-            for path in removed {
-                if accepted.remove(path).is_some() {
-                    changes.removed.push(path.clone());
-                }
+            if let Some(file) = upstream.get(&path) {
+                accepted.insert(path.clone(), file.clone());
+                changes.added.push(path);
+            }
+        }
+        for path in old_kept.difference(&new_kept) {
+            if accepted.remove(path).is_some() {
+                changes.removed.push(path.clone());
             }
         }
         if old.frontmatter != current.frontmatter {
