@@ -136,7 +136,8 @@ pub enum RewriteError {
     Aborted,
     /// The terminal could not be read or written.
     Terminal(io::Error),
-    /// The proposed Skill in `output/` was rejected.
+    /// The proposed Skill in `output/` was rejected, and the user did not
+    /// fix it; it is discarded with the staging directory.
     Output(OutputError),
 }
 
@@ -164,7 +165,9 @@ impl fmt::Display for RewriteError {
             ),
             Self::Aborted => f.write_str("the rewrite was stopped; nothing was accepted"),
             Self::Terminal(err) => write!(f, "cannot use the terminal: {err}"),
-            Self::Output(err) => write!(f, "the proposed Skill was rejected: {err}"),
+            Self::Output(err) => {
+                write!(f, "the proposed Skill was rejected and discarded: {err}")
+            }
         }
     }
 }
@@ -197,14 +200,20 @@ impl From<AdaptationError> for RewriteError {
 /// `runner`, then validates and diffs the proposed Skill. The staging
 /// directory is removed when this returns, whatever the outcome.
 ///
+/// A rejected proposal is not dropped at once: the reason is printed and
+/// the user may fix `output/` by hand and confirm again, so the work of an
+/// agent session or a manual rewrite survives a single invalid detail.
+///
 /// `terminal_in` and `terminal_out` carry the exchange with the user:
-/// progress messages, and the confirmation awaited in manual mode.
+/// progress messages, the confirmation awaited in manual mode, and the
+/// confirmation after a rejected proposal.
 ///
 /// # Errors
 ///
 /// Returns a [`RewriteError`] when the staging directory cannot be
 /// prepared, the agent cannot be started or fails, the user stops a manual
-/// rewrite, or the proposed Skill is rejected.
+/// rewrite, or the proposed Skill is rejected and the user stops instead of
+/// fixing it.
 pub fn rewrite(
     job: Job,
     runner: &Runner,
@@ -213,5 +222,29 @@ pub fn rewrite(
 ) -> Result<Proposal, RewriteError> {
     let staging = Staging::create(job)?;
     runner.run(&staging, terminal_in, terminal_out)?;
-    staging.collect()
+    loop {
+        match staging.collect() {
+            Err(RewriteError::Output(err)) => {
+                writeln!(
+                    terminal_out,
+                    "The proposed Skill was rejected: {err}\n\
+                     Fix it in {}/ to keep the work done so far.",
+                    staging.output_dir().display()
+                )
+                .map_err(RewriteError::Terminal)?;
+                let again = runner::confirm(
+                    terminal_in,
+                    terminal_out,
+                    &format!(
+                        "Press Enter to validate it again, or type `{}` to discard it: ",
+                        runner::ABORT
+                    ),
+                )?;
+                if !again {
+                    return Err(RewriteError::Output(err));
+                }
+            }
+            result => return result,
+        }
+    }
 }

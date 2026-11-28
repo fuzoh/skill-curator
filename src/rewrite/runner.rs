@@ -31,7 +31,7 @@ use super::{RewriteError, Staging};
 pub const AGENT_PROMPT: &str = "Read BRIEF.md in the current directory and follow it: write the complete proposed Skill into output/, change nothing else, then end the session.";
 
 /// Answer that stops a manual rewrite.
-const ABORT: &str = "abort";
+pub(super) const ABORT: &str = "abort";
 /// `claude` option loading extra settings from a file or a JSON string.
 const CLAUDE_SETTINGS: &str = "--settings";
 /// `claude` option disabling every skill and command for the session.
@@ -204,21 +204,40 @@ fn manual(
         staging.skill()
     )
     .map_err(RewriteError::Terminal)?;
+    if confirm(
+        terminal_in,
+        terminal_out,
+        &format!("Press Enter when the proposed Skill is ready, or type `{ABORT}` to stop: "),
+    )? {
+        Ok(())
+    } else {
+        Err(RewriteError::Aborted)
+    }
+}
+
+/// Asks `question` until the user presses Enter (`true`) or types
+/// [`ABORT`] or closes the input (`false`).
+///
+/// # Errors
+///
+/// Returns [`RewriteError::Terminal`] when the terminal cannot be used.
+pub(super) fn confirm(
+    terminal_in: &mut dyn BufRead,
+    terminal_out: &mut dyn Write,
+    question: &str,
+) -> Result<bool, RewriteError> {
     loop {
-        write!(
-            terminal_out,
-            "Press Enter when the proposed Skill is ready, or type `{ABORT}` to stop: "
-        )
-        .and_then(|()| terminal_out.flush())
-        .map_err(RewriteError::Terminal)?;
+        write!(terminal_out, "{question}")
+            .and_then(|()| terminal_out.flush())
+            .map_err(RewriteError::Terminal)?;
         let mut answer = String::new();
         let read = terminal_in
             .read_line(&mut answer)
             .map_err(RewriteError::Terminal)?;
         match answer.trim() {
-            _ if read == 0 => return Err(RewriteError::Aborted),
-            "" => return Ok(()),
-            ABORT => return Err(RewriteError::Aborted),
+            _ if read == 0 => return Ok(false),
+            "" => return Ok(true),
+            ABORT => return Ok(false),
             other => writeln!(terminal_out, "Unknown answer `{other}`.")
                 .map_err(RewriteError::Terminal)?,
         }

@@ -5,7 +5,7 @@
 //! directory.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, Cursor, Read, Write};
@@ -700,29 +700,44 @@ fn a_missing_agent_binary_is_reported() -> TestResult {
 /// What the user does in the staging directory before confirming.
 type UserEdit = Box<dyn FnOnce(&Path)>;
 
-/// The terminal of a manual rewrite: everything printed is kept, and the
-/// first read plays the user, who edits the staging directory named in the
-/// printed text and then answers.
+/// The terminal of a rewrite: everything printed is kept, and the user
+/// answers each question in turn. Before the n-th answer, the user makes the
+/// n-th edit, if any, in the staging directory named in the printed text.
 struct ManualUser {
     printed: Rc<RefCell<Vec<u8>>>,
     answers: Cursor<Vec<u8>>,
-    edit: Option<UserEdit>,
+    edits: VecDeque<UserEdit>,
+    /// Position in `answers` at the last edit.
+    edited_at: Option<u64>,
 }
 
 impl ManualUser {
     fn act(&mut self) {
-        let Some(edit) = self.edit.take() else {
+        let position = self.answers.position();
+        if self.edited_at == Some(position) {
+            return;
+        }
+        self.edited_at = Some(position);
+        let Some(edit) = self.edits.pop_front() else {
             return;
         };
         let printed = String::from_utf8_lossy(&self.printed.borrow()).into_owned();
-        let Some(dir) = printed
-            .lines()
-            .find_map(|line| line.split_once("`: ").map(|(_, dir)| dir.to_owned()))
-        else {
+        let Some(dir) = staging_dir(&printed) else {
             return;
         };
-        edit(Path::new(&dir));
+        edit(&dir);
     }
+}
+
+/// The first staging directory named in `printed`.
+fn staging_dir(printed: &str) -> Option<PathBuf> {
+    printed.split_whitespace().find_map(|word| {
+        let start = word.find("/skill-curator-rewrite-")? + 1;
+        let end = word[start..]
+            .find('/')
+            .map_or(word.len(), |end| start + end);
+        Some(PathBuf::from(&word[..end]))
+    })
 }
 
 impl Read for ManualUser {
@@ -758,14 +773,15 @@ impl Write for Printed {
 
 fn run_manual(
     answers: &str,
-    edit: Option<UserEdit>,
+    edits: Vec<UserEdit>,
     runner: &Runner,
 ) -> (Result<Proposal, RewriteError>, String) {
     let printed = Rc::new(RefCell::new(Vec::new()));
     let mut user = ManualUser {
         printed: Rc::clone(&printed),
         answers: Cursor::new(answers.as_bytes().to_vec()),
-        edit,
+        edits: edits.into(),
+        edited_at: None,
     };
     let job = match adaptation_job(true) {
         Ok(job) => job,
@@ -797,7 +813,7 @@ fn manual_mode_prints_the_staging_directory_and_resumes_on_confirmation() -> Tes
             let _ = fs::write(&skill_md, text);
         }
     });
-    let (result, printed) = run_manual("\n", Some(edit), &runner);
+    let (result, printed) = run_manual("\n", vec![edit], &runner);
     let proposal = result?;
 
     assert!(!mock.has_recorded("cwd"), "manual mode started an agent");
@@ -831,7 +847,7 @@ fn manual_mode_prints_the_staging_directory_and_resumes_on_confirmation() -> Tes
 #[test]
 fn manual_mode_asks_again_after_an_unknown_answer() -> TestResult {
     let runner = Runner::new(Agent::Manual);
-    let (result, printed) = run_manual("yes\n\n", None, &runner);
+    let (result, printed) = run_manual("yes\n\n", Vec::new(), &runner);
     let proposal = result?;
     assert!(printed.contains("Unknown answer `yes`."), "{printed}");
     assert_eq!(printed.matches("Press Enter").count(), 2, "{printed}");
@@ -843,12 +859,101 @@ fn manual_mode_asks_again_after_an_unknown_answer() -> TestResult {
 #[test]
 fn manual_mode_can_be_stopped() -> TestResult {
     for answers in ["abort\n", ""] {
-        let (result, _) = run_manual(answers, None, &Runner::new(Agent::Manual));
+        let (result, _) = run_manual(answers, Vec::new(), &Runner::new(Agent::Manual));
         assert!(
             matches!(result, Err(RewriteError::Aborted)),
             "{answers:?}: {result:?}"
         );
     }
+    Ok(())
+}
+
+/// A user edit writing `text` into `output/SKILL.md`.
+fn write_skill_md(text: &'static str) -> UserEdit {
+    Box::new(move |dir: &Path| {
+        let _ = fs::write(dir.join("output/SKILL.md"), text);
+    })
+}
+
+const INVALID_SKILL_MD: &str = "---\nname: [grilling\n---\nHand-written.\n";
+const FIXED_SKILL_MD: &str = "---\nname: grilling\n---\nHand-written.\n";
+
+#[test]
+fn a_rejected_manual_rewrite_can_be_fixed_and_confirmed_again() -> TestResult {
+    let edits = vec![
+        write_skill_md(INVALID_SKILL_MD),
+        write_skill_md(FIXED_SKILL_MD),
+    ];
+    let (result, printed) = run_manual("\n\n", edits, &Runner::new(Agent::Manual));
+    let proposal = result?;
+    assert_eq!(proposal.skill.skill_md()?, FIXED_SKILL_MD);
+    let dir = staging_dir(&printed).ok_or("no staging directory printed")?;
+    // The terminal echoes the user's Enter, so no line break is printed
+    // after a question.
+    let (_, rejection) = printed
+        .split_once("The proposed Skill was rejected: `output/SKILL.md`: ")
+        .ok_or_else(|| format!("no rejection in\n{printed}"))?;
+    assert!(
+        rejection.starts_with("the frontmatter is not valid YAML"),
+        "{rejection}"
+    );
+    assert!(
+        printed.contains(&format!(
+            "Fix it in {}/ to keep the work done so far.\n\
+             Press Enter to validate it again, or type `abort` to discard it: ",
+            dir.join("output").display()
+        )),
+        "{printed}"
+    );
+    assert!(!dir.exists(), "the staging directory is removed");
+    Ok(())
+}
+
+#[test]
+fn a_rejected_rewrite_is_discarded_only_when_the_user_stops() -> TestResult {
+    for answers in ["\nabort\n", "\n"] {
+        let edits = vec![write_skill_md(INVALID_SKILL_MD)];
+        let (result, printed) = run_manual(answers, edits, &Runner::new(Agent::Manual));
+        let Err(err @ RewriteError::Output(OutputError::InvalidFrontmatter(_))) = result else {
+            return Err(format!("{answers:?}: unexpected outcome: {result:?}").into());
+        };
+        assert!(
+            err.to_string()
+                .starts_with("the proposed Skill was rejected and discarded: "),
+            "{err}"
+        );
+        assert_eq!(printed.matches("Press Enter").count(), 2, "{printed}");
+        let dir = staging_dir(&printed).ok_or("no staging directory printed")?;
+        assert!(!dir.exists(), "the staging directory is removed");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_rejected_agent_rewrite_can_be_fixed_by_hand() -> TestResult {
+    let mock = Mock::new()?;
+    let script = mock.script(
+        "pi",
+        "printf -- '---\\nname: [grilling\\n---\\nAgent work.\\n' > output/SKILL.md",
+    )?;
+    let runner = Runner::new(Agent::Pi).with_program(&script);
+    let edit: UserEdit = Box::new(|dir: &Path| {
+        let skill_md = dir.join("output/SKILL.md");
+        if let Ok(text) = fs::read_to_string(&skill_md) {
+            let _ = fs::write(&skill_md, text.replace("[grilling", "grilling"));
+        }
+    });
+    let (result, printed) = run_manual("\n", vec![edit], &runner);
+    let proposal = result?;
+    assert!(mock.has_recorded("cwd"), "the agent was not started");
+    assert!(
+        printed.contains("The proposed Skill was rejected: "),
+        "{printed}"
+    );
+    assert_eq!(
+        proposal.skill.skill_md()?,
+        "---\nname: grilling\n---\nAgent work.\n"
+    );
     Ok(())
 }
 

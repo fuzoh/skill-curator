@@ -406,6 +406,10 @@ Choices made there:
   staging directory by its last component (the fixed prefix plus random
   letters and digits), so no glob or JSON syntax from the temporary
   directory path can reach it.
+- A rejected proposal (agent or manual) is not discarded at once: the
+  reason is printed and the user may fix `output/` by hand and press Enter
+  to validate it again. `abort` or end of input discards it with the
+  staging directory, and the error says so.
 - `output/` is accepted only as a real directory of regular files and
   directories: symbolic links anywhere (including `output/` itself), hard
   links (a file with more than one link may live outside `output/`),
