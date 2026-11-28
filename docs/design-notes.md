@@ -262,3 +262,74 @@ Choices made there:
   files with their summary, or says that no license was found. It is written
   atomically, replacing (never following) a symbolic link at its path.
   License texts are not copied into it.
+
+### Deterministic Adaptation and `materialize`
+
+Implemented in
+[Deterministic Adaptation pipeline (D2 filtering, D1 frontmatter) and materialize command](https://github.com/fuzoh/skill-curator/issues/32);
+`src/adaptation.rs`, `src/adaptation/`, and `src/materialize.rs` are the
+reference. Choices made there:
+
+- D2 rule sets apply in order: presets as listed, then the Skill's own rules
+  (a Composition input has its own rules only). A file is kept when every
+  rule set keeps it: its `include` globs, when present, select it and none
+  of its `exclude` globs do. A glob selects a file when it matches the
+  file's path or one of its parent directories, so `evals`, `evals/`, and
+  `evals/**` all drop `evals/`; a trailing `/` matches directories only.
+  `*` and `?` stay within one path component, `**` crosses any number, `\`
+  escapes, matching is case-sensitive. Invalid globs are Manifest problems.
+- Rules that drop the top-level `SKILL.md` are an error naming the rule,
+  never an implicit exception that keeps it.
+- D1 edits the frontmatter entry by entry instead of re-serialising it:
+  untouched entries keep their exact text, comments, and quoting, and the
+  body after the closing `---` is kept byte for byte (fenced blocks,
+  horizontal rules, a byte order mark, and CRLF line endings included).
+  Rules apply as `remove`, then `keep_only`, then `set`. A set value is
+  written as one line of flow YAML: plain when it cannot be read as
+  anything else, else double-quoted; TOML dates are written as strings.
+  Every edit is parsed again and refused unless it yields exactly the
+  expected entries, so an edit that would change an untouched entry (for
+  example through a shared anchor) is refused. Frontmatter with several
+  documents, duplicate or non-scalar top-level keys, or nesting deeper than
+  64 levels is refused too. The same helper serves `det(R)`, the
+  re-enforcement of D1 on agent output, and install-time Destination
+  rules.
+- `det(R)` applies D2, then D1, to an upstream Skill read as regular files
+  only. Written Skills are new directories with `0644` or `0755` files.
+- Each `lock.toml` entry of an upstream Skill records an `applied` table:
+  the D1 and D2 rules (presets expanded, in order), the D2 rules of each
+  Composition input, and the hash of the written intent the accepted Skill
+  was produced from. `inputs_hash` alone cannot tell a D1 change from a D2
+  or intent change, and `materialize` must not need the old Manifest.
+  `update` must record it when it accepts a Skill.
+- `materialize` never fetches: it reads the pinned Revision from the Source
+  cache only and reports a Revision the cache lacks as an error asking for
+  `skill-curator update`. It works on the Collection given by
+  `--collection`, else the working directory.
+- Output drift (files that no longer hash to `output_hash`, a missing
+  directory, or a symbolic link or special file inside it) is reported as
+  manual edits, and that Skill is left alone. `--accept <skill>` records
+  the current files as accepted (reminding the user to update the written
+  intent, and warning when `SKILL.md` breaks the Skill's D1 rules), then
+  replays any pending rule change on top. `--reset <skill>` rebuilds
+  `det(R)` at the pinned Revision with the current rules, discarding the
+  edits; on an agent-assisted Skill it records the intent as not applied,
+  so later runs ask for an agent rewrite. A Composition has no
+  deterministic state and cannot be reset; its Git history can restore it.
+- Input drift is classified against `applied`. A Skill still equal to
+  `det(R)` under its old rules is rebuilt under the new ones. Otherwise
+  (agent rewrites, accepted edits), D2 exclusions remove files, D1 changes
+  go through a replay that changes only the keys whose upstream value the
+  change affects (a key a removed rule used to drop comes back with its
+  upstream value) and then enforces the new rules, and files newly kept by
+  D2 are copied from the pinned Revision on deterministic Skills. Newly
+  kept files and Composition input rule changes on agent-assisted Skills
+  (Adapt with an intent, Compositions), and any intent change, are reported
+  as needing an agent rewrite or a reset. A removed intent, and a newly
+  kept file clashing with an existing one, need a reset. A changed Source
+  or `upstream_path` needs `update`.
+- Each changed Skill is written to a staging directory inside `skills/`
+  and swapped into place, then `lock.toml` is written atomically, one
+  Skill at a time. Local Skills are recorded (`output_hash` only) whenever
+  their files change. The command exits with status 1 when any Skill still
+  needs attention, after printing one line per Skill.
