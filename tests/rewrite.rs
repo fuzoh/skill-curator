@@ -195,8 +195,51 @@ fn three_way_adaptation_staging_layout() -> TestResult {
     Ok(())
 }
 
+/// The 2-way fallback: the Skill was accepted, but the Revision it was
+/// produced from (`R_old`) is unreachable.
 #[test]
-fn two_way_adaptation_staging_layout() -> TestResult {
+fn two_way_fallback_adaptation_staging_layout() -> TestResult {
+    let job = adaptation_job(false)?;
+    let Inputs::Adaptation {
+        base: None,
+        upstream,
+    } = job.inputs.clone()
+    else {
+        panic!("not a two-way Adaptation");
+    };
+    let current = job.current.clone().ok_or("no current")?;
+    let staging = Staging::create(job)?;
+    let root = staging.path();
+
+    assert_read_only_view(&root.join("upstream"), &upstream)?;
+    assert_read_only_view(&root.join("current"), &current)?;
+    assert!(!root.join("base").exists());
+    assert!(!root.join("diffs").exists());
+    // `output/` starts as accepted_local, so the accepted edits are kept.
+    assert_eq!(SkillTree::read(&staging.output_dir())?, current);
+    fs::write(staging.output_dir().join("new.md"), "x")?;
+
+    let brief = read(&root.join("BRIEF.md"))?;
+    for expected in [
+        "There is no `base/`: the Revision the accepted Skill was produced from is unavailable.",
+        "This is a two-way comparison: compare `current/` with `upstream/`",
+        "- `upstream/`:",
+        "- `current/`:",
+        "Unknown: the Revision the accepted Skill was produced from is unavailable.",
+        "`output/` starts as a copy of `current/`",
+    ] {
+        assert!(brief.contains(expected), "missing {expected:?} in\n{brief}");
+    }
+    assert!(!brief.contains("- `base/`:"), "{brief}");
+    assert!(!brief.contains("There is no `current/`"), "{brief}");
+    assert!(!brief.contains("first rewrite"), "{brief}");
+    Ok(())
+}
+
+/// An Adaptation rewritten for the first time: neither `R_old` nor
+/// accepted_local exist.
+#[test]
+fn never_accepted_adaptation_staging_layout() -> TestResult {
     let mut job = adaptation_job(false)?;
     job.current = None;
     job.guidance = Some("Keep the examples.".to_owned());
@@ -216,16 +259,19 @@ fn two_way_adaptation_staging_layout() -> TestResult {
 
     let brief = read(&root.join("BRIEF.md"))?;
     for expected in [
-        "There is no `base/`",
-        "This is a two-way comparison",
-        "There is no `current/`",
-        "Unknown: the Revision the accepted Skill was produced from is unavailable.",
+        "There is no `base/`: this is the first rewrite of the Skill",
+        "Start from `upstream/` and the written intent.",
+        "There is no `current/`: the Skill has not been accepted before.",
+        "## Upstream changes\n\nNothing to compare: the Skill has not been accepted before.\n",
         "## Extra guidance\n\nThe user reviewed an earlier proposal and asks for this:\n\nKeep the examples.\n",
         "`output/` starts as a copy of `upstream/`",
     ] {
         assert!(brief.contains(expected), "missing {expected:?} in\n{brief}");
     }
-    assert!(!brief.contains("- `base/`:"), "{brief}");
+    // No view to compare and no accepted Skill to blame.
+    for unexpected in ["- `base/`:", "two-way", "compare `current/`", "Unknown:"] {
+        assert!(!brief.contains(unexpected), "{unexpected:?} in\n{brief}");
+    }
     Ok(())
 }
 

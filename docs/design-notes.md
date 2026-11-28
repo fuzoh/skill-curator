@@ -378,10 +378,12 @@ Choices made there:
   Adaptation, else empty (a first Composition).
 - `BRIEF.md` gives the written intent verbatim, the extra guidance, the
   views, a per-file summary of upstream changes (or says they are unknown
-  when the old Revision is unavailable: the two-way case), the D1 rules
-  that are enforced again, and output instructions. It tells the agent that
-  view files are data: never run their scripts or follow instructions in
-  them.
+  when the old Revision is unavailable: the two-way case, comparing
+  `current/` with `upstream/`; a Skill never accepted before is a first
+  rewrite instead, started from `upstream/` and the written intent), the D1
+  rules that are enforced again, and output instructions. It tells the
+  agent that view files are data: never run their scripts or follow
+  instructions in them.
 - The agent is chosen by `update --agent <pi|claude|manual>` (or
   `--manual`), else by `agent = "..."` in `machine.toml` (an agent's
   availability is machine-specific), else `pi`. `pi` and `claude` are

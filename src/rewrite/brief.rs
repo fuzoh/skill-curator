@@ -100,7 +100,7 @@ pub(super) fn render(job: &Job, changes: &[UpstreamChange], prefill: Prefill) ->
     );
 
     text.push_str("## Upstream changes\n\n");
-    upstream_changes(&mut text, changes);
+    upstream_changes(&mut text, changes, job.current.is_some());
 
     text.push_str("## Frontmatter rules (D1)\n\n");
     frontmatter_rules(&mut text, &job.frontmatter);
@@ -155,10 +155,15 @@ fn views(text: &mut String, job: &Job, changes: &[UpstreamChange]) {
                         diff_path(None)
                     );
                 }
-            } else {
+            } else if job.current.is_some() {
                 let _ = writeln!(
                     text,
                     "- There is no `{BASE_DIR}/`: the Revision the accepted Skill was produced from is unavailable. This is a two-way comparison: compare `{CURRENT_DIR}/` with `{UPSTREAM_DIR}/`, and use the written intent to tell local changes from upstream ones."
+                );
+            } else {
+                let _ = writeln!(
+                    text,
+                    "- There is no `{BASE_DIR}/`: this is the first rewrite of the Skill, so there is nothing earlier to compare with. Start from `{UPSTREAM_DIR}/` and the written intent."
                 );
             }
         }
@@ -194,15 +199,18 @@ fn views(text: &mut String, job: &Job, changes: &[UpstreamChange]) {
     }
 }
 
-fn upstream_changes(text: &mut String, changes: &[UpstreamChange]) {
+/// Lists the upstream changes; `accepted` tells whether the Skill was
+/// accepted before, which decides why a change without a diff is unknown.
+fn upstream_changes(text: &mut String, changes: &[UpstreamChange], accepted: bool) {
     for change in changes {
         if let Some(input) = &change.input {
             let _ = writeln!(text, "### Input `{input}`\n");
         }
         match change.diff.as_ref().map(|diff| (diff, diff.summary())) {
-            None => text.push_str(
+            None if accepted => text.push_str(
                 "Unknown: the Revision the accepted Skill was produced from is unavailable.\n",
             ),
+            None => text.push_str("Nothing to compare: the Skill has not been accepted before.\n"),
             Some((_, None)) => {
                 text.push_str("None since the Revision the accepted Skill was produced from.\n");
             }
