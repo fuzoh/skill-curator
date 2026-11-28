@@ -25,6 +25,14 @@ examine_globs = [
     # and license detection.
     "src/source.rs",
     "src/source/**/*.rs",
+    # Deterministic Adaptation: refusal of symbolic links, special files, and
+    # unsafe paths in Skill trees, the mandatory `SKILL.md` check, and D2
+    # file selection.
+    "src/adaptation.rs",
+    "src/adaptation/files.rs",
+    # Overwrite protection of manual edits in `skills/` and the staged swap
+    # of Skill directories.
+    "src/materialize.rs",
     # Update conflict handling.
     "src/conflict.rs",
     "src/conflict/**/*.rs",

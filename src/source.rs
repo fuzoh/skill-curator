@@ -120,6 +120,14 @@ pub enum SourceError {
         /// What `git` reported when asked for it.
         detail: String,
     },
+    /// The Revision is not in the local cache, and the caller asked not to
+    /// fetch it.
+    NotCached {
+        /// Source name in the Manifest.
+        source_name: Name,
+        /// The missing Revision.
+        revision: Revision,
+    },
     /// `upstream_path` is not a Skill directory at the Revision. Nothing is
     /// chosen in its place.
     SkillNotFound {
@@ -186,6 +194,13 @@ impl fmt::Display for SourceError {
                 }
                 Ok(())
             }
+            Self::NotCached {
+                source_name,
+                revision,
+            } => write!(
+                f,
+                "Revision {revision} of Source `{source_name}` is not in the local cache, and this command never fetches; run `skill-curator update` to fetch the Source, then retry"
+            ),
             Self::SkillNotFound {
                 source_name,
                 revision,
@@ -366,8 +381,49 @@ impl SourceCache {
         revision: &Revision,
         upstream_path: &RelativePath,
     ) -> Result<ExtractedSkill, SourceError> {
+        self.extract_with(name, source, revision, upstream_path, true)
+    }
+
+    /// Like [`SourceCache::extract`], but reads the Revision from the cache
+    /// only: nothing is cloned or fetched, so the Source is never contacted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceError::NotCached`] when the Source has no cache yet
+    /// or the cache lacks the Revision, and the errors of
+    /// [`SourceCache::extract`] otherwise.
+    pub fn extract_cached(
+        &self,
+        name: &Name,
+        source: &Source,
+        revision: &Revision,
+        upstream_path: &RelativePath,
+    ) -> Result<ExtractedSkill, SourceError> {
+        self.extract_with(name, source, revision, upstream_path, false)
+    }
+
+    fn extract_with(
+        &self,
+        name: &Name,
+        source: &Source,
+        revision: &Revision,
+        upstream_path: &RelativePath,
+        fetch: bool,
+    ) -> Result<ExtractedSkill, SourceError> {
         check_source(name, source)?;
-        let repository = self.ensure_repository(name, source)?;
+        let not_cached = || SourceError::NotCached {
+            source_name: name.clone(),
+            revision: revision.clone(),
+        };
+        let repository = if fetch {
+            self.ensure_repository(name, source)?
+        } else {
+            let repository = self.repository(name, &source.url);
+            if !repository.is_dir() || !self.has_commit(&repository, revision)? {
+                return Err(not_cached());
+            }
+            repository
+        };
         self.ensure_revision(&repository, name, source, revision)?;
 
         let listing = self.git.run(

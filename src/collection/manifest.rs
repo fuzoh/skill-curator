@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::Problem;
+use crate::adaptation::files::pattern_problem;
 use crate::safety::{InstallPath, Name, PathPattern, RelativePath};
 
 /// Collection directory holding written Adaptation and Composition intents.
@@ -343,6 +344,11 @@ impl Manifest {
                 &preset.frontmatter,
                 &mut problems,
             );
+            check_files(
+                &format!("presets.{name}.files"),
+                &preset.files,
+                &mut problems,
+            );
         }
         for (name, skill) in &self.skills {
             self.check_skill(name, skill, &mut problems);
@@ -377,6 +383,7 @@ impl Manifest {
                     }
                 }
                 check_frontmatter(&format!("{at}.frontmatter"), &adapt.frontmatter, problems);
+                check_files(&format!("{at}.files"), &adapt.files, problems);
                 if let Some(intent) = &adapt.intent {
                     check_under(&format!("{at}.intent"), intent, INTENTS_DIR, problems);
                 }
@@ -395,6 +402,7 @@ impl Manifest {
                 for (input_name, input) in &composition.inputs {
                     let input_at = format!("{at}.inputs.{input_name}");
                     self.check_source_ref(&input_at, &input.source, problems);
+                    check_files(&format!("{input_at}.files"), &input.files, problems);
                     if let Some(other) =
                         upstream_skills.insert((&input.source, &input.upstream_path), input_name)
                     {
@@ -522,6 +530,28 @@ fn check_frontmatter(at: &str, rules: &FrontmatterRules, problems: &mut Vec<Prob
                     ),
                 ));
             }
+        }
+    }
+}
+
+fn check_files(at: &str, rules: &FileRules, problems: &mut Vec<Problem>) {
+    let patterns = rules
+        .exclude
+        .iter()
+        .map(|pattern| ("exclude", pattern))
+        .chain(
+            rules
+                .include
+                .iter()
+                .flatten()
+                .map(|pattern| ("include", pattern)),
+        );
+    for (list, pattern) in patterns {
+        if let Some(problem) = pattern_problem(pattern) {
+            problems.push(Problem::new(
+                format!("{at}.{list}"),
+                format!("`{pattern}` is not a valid glob: {problem}"),
+            ));
         }
     }
 }
@@ -1005,6 +1035,44 @@ skills_dir = "/srv/agents/skills"
             [
                 "presets.p.frontmatter: key `icon` is set but not listed in `keep_only`, which drops it; add it to `keep_only` or remove the `set` rule"
             ]
+        );
+    }
+
+    #[test]
+    fn reports_invalid_file_globs() {
+        let found = problems(
+            r#"
+[sources.up]
+url = "https://example.com/up.git"
+
+[presets.p]
+files = { exclude = ["evals/[a"] }
+
+[skills.a]
+mode = "adapt"
+source = "up"
+upstream_path = "a"
+files = { exclude = ["ok/**"], include = ["SKILL.md", "{x"] }
+
+[skills.c]
+mode = "composition"
+intent = "intents/c.md"
+
+[skills.c.inputs.one]
+source = "up"
+upstream_path = "one"
+files = { exclude = ["[z"] }
+
+[skills.c.inputs.two]
+source = "up"
+upstream_path = "two"
+"#,
+        );
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(found[0].starts_with("presets.p.files.exclude: `evals/[a` is not a valid glob"));
+        assert!(found[1].starts_with("skills.a.files.include: `{x` is not a valid glob"));
+        assert!(
+            found[2].starts_with("skills.c.inputs.one.files.exclude: `[z` is not a valid glob")
         );
     }
 

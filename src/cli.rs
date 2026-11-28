@@ -6,9 +6,13 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use crate::Error;
+use crate::collection::Collection;
+use crate::materialize::{self, Options};
+use crate::safety::{HomeDir, Name, PathError};
+use crate::source::{Git, SourceCache};
 
 /// Download, adapt, and maintain third-party agent Skills in a user-owned
 /// Collection.
@@ -30,7 +34,7 @@ pub struct Cli {
 }
 
 /// The v1 commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
     /// Report Collection drift, Destination drift, and known upstream updates.
     Status,
@@ -41,21 +45,37 @@ pub enum Command {
     Update,
     /// Replay local Adaptation and Composition changes at the pinned Revision,
     /// without fetching.
-    Materialize,
+    Materialize(MaterializeArgs),
     /// Copy accepted Skills and assembled Fragments to the enabled
     /// Destinations.
     Install,
 }
 
+/// Choices for Skills whose files in `skills/<name>/` were edited by hand.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct MaterializeArgs {
+    /// Accept the manual edits of Skill SKILL into lock.toml (repeatable).
+    #[arg(long, value_name = "SKILL", value_parser = parse_name)]
+    pub accept: Vec<Name>,
+    /// Discard the manual edits of Skill SKILL and rebuild its deterministic
+    /// Adaptation at the pinned Revision (repeatable).
+    #[arg(long, value_name = "SKILL", value_parser = parse_name)]
+    pub reset: Vec<Name>,
+}
+
+fn parse_name(raw: &str) -> Result<Name, PathError> {
+    Name::new(raw)
+}
+
 impl Command {
     /// Name of the command as typed on the command line.
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
             Self::Status => "status",
             Self::Check => "check",
             Self::Update => "update",
-            Self::Materialize => "materialize",
+            Self::Materialize(_) => "materialize",
             Self::Install => "install",
         }
     }
@@ -65,12 +85,59 @@ impl Command {
 ///
 /// # Errors
 ///
-/// Returns an [`Error`] when the command fails; in this release every command
-/// reports [`Error::NotImplemented`].
+/// Returns an [`Error`] when the command fails or leaves Skills needing
+/// attention. Commands without behaviour yet report
+/// [`Error::NotImplemented`].
 pub fn run(cli: &Cli) -> Result<(), Error> {
-    Err(Error::NotImplemented {
-        command: cli.command.name(),
-    })
+    match &cli.command {
+        Command::Materialize(args) => run_materialize(cli, args),
+        command => Err(Error::NotImplemented {
+            command: command.name(),
+        }),
+    }
+}
+
+fn run_materialize(cli: &Cli, args: &MaterializeArgs) -> Result<(), Error> {
+    let root = collection_root(cli)?;
+    let cache = source_cache()?;
+    let collection = Collection::load(&root)?;
+    let options = Options {
+        accept: args.accept.clone(),
+        reset: args.reset.clone(),
+    };
+    let report = materialize::materialize(&collection, &cache, &options)?;
+    for (name, outcome) in &report.skills {
+        println!("{}", outcome.describe(name));
+    }
+    match report.pending() {
+        0 => Ok(()),
+        count => Err(Error::Unresolved { count }),
+    }
+}
+
+/// The Collection directory: `--collection`, or the working directory.
+fn collection_root(cli: &Cli) -> Result<PathBuf, Error> {
+    match &cli.collection {
+        Some(root) => Ok(root.clone()),
+        None => std::env::current_dir().map_err(|err| Error::Environment {
+            message: format!("cannot read the working directory: {err}; pass `--collection`"),
+        }),
+    }
+}
+
+/// The Source cache under `$XDG_CACHE_HOME`, or `~/.cache`.
+fn source_cache() -> Result<SourceCache, Error> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| Error::Environment {
+            message: "`HOME` is not set; it locates the Source cache".to_owned(),
+        })
+        .and_then(|home| {
+            HomeDir::new(home).map_err(|err| Error::Environment {
+                message: format!("`HOME` cannot locate the Source cache: {err}"),
+            })
+        })?;
+    let root = SourceCache::default_root(std::env::var_os("XDG_CACHE_HOME").as_deref(), &home);
+    Ok(SourceCache::new(root, Git::system()))
 }
 
 /// Process entry point: parses `std::env::args`, runs the command, and maps
@@ -124,7 +191,7 @@ mod tests {
             Command::Status,
             Command::Check,
             Command::Update,
-            Command::Materialize,
+            Command::Materialize(MaterializeArgs::default()),
             Command::Install,
         ]
         .map(|command| command.name().to_owned());
@@ -133,12 +200,34 @@ mod tests {
 
     #[test]
     fn run_reports_the_command_as_not_implemented() {
-        let cli = Cli::try_parse_from(["skill-curator", "materialize"]).unwrap();
-        assert_eq!(
+        let cli = Cli::try_parse_from(["skill-curator", "status"]).unwrap();
+        assert!(matches!(
             run(&cli),
-            Err(Error::NotImplemented {
-                command: "materialize"
+            Err(Error::NotImplemented { command: "status" })
+        ));
+    }
+
+    #[test]
+    fn materialize_takes_repeatable_skill_names() {
+        let cli = Cli::try_parse_from([
+            "skill-curator",
+            "materialize",
+            "--accept",
+            "grilling",
+            "--reset",
+            "code-review",
+            "--accept",
+            "tdd",
+        ])
+        .unwrap();
+        let name = |raw| Name::new(raw).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Materialize(MaterializeArgs {
+                accept: vec![name("grilling"), name("tdd")],
+                reset: vec![name("code-review")],
             })
         );
+        assert!(Cli::try_parse_from(["skill-curator", "materialize", "--reset", "../x"]).is_err());
     }
 }

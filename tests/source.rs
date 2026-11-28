@@ -557,6 +557,45 @@ fn a_cached_revision_survives_an_upstream_rewrite() -> TestResult {
 }
 
 #[test]
+fn cache_only_extraction_never_contacts_the_source() -> TestResult {
+    let sandbox = Sandbox::new()?;
+    let upstream = sandbox.upstream("upstream")?;
+    upstream.write("skills/a/SKILL.md", "pinned\n")?;
+    let pinned = upstream.commit("pinned")?;
+    let cache = sandbox.cache();
+    let source_name = name("s")?;
+    let source = upstream.source();
+    let skill = path("skills/a")?;
+
+    // No cache yet: nothing is cloned.
+    let err = cache
+        .extract_cached(&source_name, &source, &pinned, &skill)
+        .err()
+        .ok_or("extraction without a cache succeeded")?;
+    assert!(matches!(err, SourceError::NotCached { .. }), "{err:?}");
+    assert!(err.to_string().contains("never fetches"));
+    assert!(!cache.root().exists(), "no cache is created");
+
+    assert_eq!(cache.fetch(&source_name, &source)?, pinned);
+    upstream.write("skills/a/SKILL.md", "later\n")?;
+    let later = upstream.commit("later")?;
+
+    // A Revision the cache lacks is not fetched, even though the Source has
+    // it.
+    let err = cache
+        .extract_cached(&source_name, &source, &later, &skill)
+        .err()
+        .ok_or("an uncached Revision was extracted")?;
+    assert!(matches!(err, SourceError::NotCached { .. }), "{err:?}");
+
+    // The cached Revision is extracted with the Source gone entirely.
+    fs::remove_dir_all(&upstream.repository)?;
+    let extracted = cache.extract_cached(&source_name, &source, &pinned, &skill)?;
+    assert_eq!(read(&extracted, SKILL_FILE)?, "pinned\n");
+    Ok(())
+}
+
+#[test]
 fn a_fresh_cache_fetches_a_pinned_revision_by_identifier() -> TestResult {
     let sandbox = Sandbox::new()?;
     let upstream = sandbox.upstream("upstream")?;
@@ -932,6 +971,7 @@ fn extracted_provenance_feeds_the_lock_and_attribution() -> TestResult {
             output_hash: tree_digest(review.path())?,
             inputs_hash: None,
             provenance: vec![review.provenance(None)],
+            applied: None,
         },
     );
     lock.skills.insert(
@@ -943,6 +983,7 @@ fn extracted_provenance_feeds_the_lock_and_attribution() -> TestResult {
                 critique.provenance(Some(name("critique")?)),
                 review.provenance(Some(name("review")?)),
             ],
+            applied: None,
         },
     );
     let reparsed = Lock::from_toml(&lock.to_toml()?)?;

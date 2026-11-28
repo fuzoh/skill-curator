@@ -6,9 +6,6 @@
 //! `lock.toml` stores them in.
 
 use std::fmt::Write as _;
-use std::fs::Permissions;
-use std::io::Write as _;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
 use super::CollectionError;
@@ -105,20 +102,7 @@ fn code(value: &str) -> String {
 ///
 /// Returns [`CollectionError::Write`] when the file cannot be written.
 pub fn write(root: &Path, lock: &Lock) -> Result<(), CollectionError> {
-    let path = root.join(ATTRIBUTION_FILE);
-    let write_error = |source| CollectionError::Write {
-        path: path.clone(),
-        source,
-    };
-    let mut file = tempfile::NamedTempFile::new_in(root).map_err(write_error)?;
-    file.write_all(render(lock).as_bytes())
-        .map_err(write_error)?;
-    // Temporary files are private; the notice is an ordinary Collection file.
-    file.as_file()
-        .set_permissions(Permissions::from_mode(0o644))
-        .map_err(write_error)?;
-    file.persist(&path).map_err(|err| write_error(err.error))?;
-    Ok(())
+    super::write_atomically(root, ATTRIBUTION_FILE, render(lock).as_bytes())
 }
 
 #[cfg(test)]

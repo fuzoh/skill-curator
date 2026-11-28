@@ -13,6 +13,9 @@ type TestResult = Result<(), Box<dyn Error>>;
 
 const SUBCOMMANDS: [&str; 5] = ["status", "check", "update", "materialize", "install"];
 
+/// Subcommands that have no behaviour yet.
+const NOT_IMPLEMENTED: [&str; 4] = ["status", "check", "update", "install"];
+
 /// Exit code for usage errors reported by the argument parser.
 const USAGE_ERROR: i32 = 2;
 /// Exit code for failures after the arguments were accepted.
@@ -201,9 +204,9 @@ fn global_flag_requires_a_value() -> TestResult {
 }
 
 #[test]
-fn every_subcommand_reports_not_implemented_yet() -> TestResult {
+fn unimplemented_subcommands_report_not_implemented_yet() -> TestResult {
     let sandbox = TempDir::new()?;
-    for name in SUBCOMMANDS {
+    for name in NOT_IMPLEMENTED {
         skill_curator(sandbox.path())
             .arg(name)
             .assert()
@@ -213,6 +216,20 @@ fn every_subcommand_reports_not_implemented_yet() -> TestResult {
                 "skill-curator: error: the `{name}` command is not implemented yet\n"
             ));
     }
+    Ok(())
+}
+
+#[test]
+fn materialize_outside_a_collection_fails_without_writing() -> TestResult {
+    let sandbox = TempDir::new()?;
+    skill_curator(sandbox.path())
+        .arg("materialize")
+        .assert()
+        .code(FAILURE)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::starts_with("skill-curator: error: "))
+        .stderr(predicate::str::contains("manifest.toml"));
+    assert_eq!(std::fs::read_dir(sandbox.path())?.count(), 0);
     Ok(())
 }
 
