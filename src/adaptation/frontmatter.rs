@@ -36,6 +36,13 @@ const MAX_DEPTH: usize = 64;
 /// are resolved by copying the anchored node, so the limit keeps hostile
 /// upstream text (an alias of an alias of ...) from exhausting memory.
 const MAX_NODES: usize = 100_000;
+/// The YAML 1.1 merge key. Readers that implement merges (PyYAML, js-yaml,
+/// and others) copy the entries of the merged mapping into the mapping that
+/// holds it, so a top-level merge can define any top-level key.
+const MERGE_KEY: &str = "<<";
+/// Tag of the merge key, as resolved from `!!merge` or written verbatim
+/// (`!<tag:yaml.org,2002:merge>`).
+const MERGE_TAG: &str = "tag:yaml.org,2002:merge";
 
 /// Why a `SKILL.md` frontmatter cannot be read or edited.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +64,13 @@ pub enum FrontmatterError {
     /// A top-level key is not a plain key at the start of its line, as in a
     /// block mapping (`key: value`).
     UnsupportedKey {
+        /// Line in `SKILL.md`, starting at 1.
+        line: usize,
+    },
+    /// A top-level key is a YAML merge key (`<<`, or a key tagged
+    /// `!!merge`). YAML readers that expand merges would bring back keys the
+    /// rules remove, so D1 refuses to edit such a frontmatter.
+    MergeKey {
         /// Line in `SKILL.md`, starting at 1.
         line: usize,
     },
@@ -98,6 +112,10 @@ impl fmt::Display for FrontmatterError {
             Self::UnsupportedKey { line } => write!(
                 f,
                 "the frontmatter key on line {line} must be plain text at the start of its line (`key: value`)"
+            ),
+            Self::MergeKey { line } => write!(
+                f,
+                "the frontmatter key on line {line} is a YAML merge key (`<<`); YAML readers that expand it could bring back keys the frontmatter rules (D1) remove, so the rules cannot be applied"
             ),
             Self::DuplicateKey { key } => {
                 write!(f, "the frontmatter key `{key}` appears more than once")
@@ -582,6 +600,16 @@ fn top_level_entries(
         let (event, line, col) = events.next()?;
         let key = match event {
             Event::MappingEnd => return Ok(entries),
+            Event::Scalar(value, _, _, tag)
+                if value == MERGE_KEY
+                    || tag.as_ref().is_some_and(|tag| {
+                        format!("{}{}", tag.handle, tag.suffix) == MERGE_TAG
+                    }) =>
+            {
+                return Err(FrontmatterError::MergeKey {
+                    line: frontmatter_line(line),
+                });
+            }
             Event::Scalar(value, style, anchor, tag) if col == 0 => {
                 let key = value.into_owned();
                 let node = Node::Scalar {
@@ -1157,6 +1185,40 @@ mod tests {
             )
             .unwrap(),
             skill("a: &x [1, 2]\nb: *x\n")
+        );
+    }
+
+    #[test]
+    fn top_level_merge_keys_are_refused() {
+        // A merge-aware YAML reader reads `name` (or `allowed-tools`) back
+        // from the merge, whatever `remove` dropped.
+        let anchored = skill("base: &b\n  name: x\n<<: *b\nname: y\n");
+        let inline = skill("<<: {allowed-tools: \"Bash(*)\"}\nname: a\n");
+        let tagged = skill("name: a\n!!merge tools: {allowed-tools: \"Bash(*)\"}\n");
+        let verbatim = skill("name: a\n!<tag:yaml.org,2002:merge> m: {allowed-tools: x}\n");
+        for (text, line) in [(&anchored, 4), (&inline, 2), (&tagged, 3), (&verbatim, 3)] {
+            assert_eq!(
+                SkillDocument::parse(text),
+                Err(FrontmatterError::MergeKey { line }),
+                "{text:?}"
+            );
+        }
+        assert_eq!(
+            apply_rules(&anchored, &[&rules(&[], &["name"], None)]),
+            Err(FrontmatterError::MergeKey { line: 4 })
+        );
+        assert_eq!(
+            apply_rules(&inline, &[&rules(&[], &["allowed-tools"], None)]),
+            Err(FrontmatterError::MergeKey { line: 2 })
+        );
+        // Without rules the frontmatter is not parsed, so nothing is refused.
+        assert_eq!(apply_rules(&inline, &[]).unwrap(), inline);
+        // A merge inside a value only defines keys of that value, which are
+        // compared as a whole.
+        let nested = skill("base: &b {a: 1}\nmetadata:\n  <<: *b\n  c: 2\nname: x\n");
+        assert_eq!(
+            apply_rules(&nested, &[&rules(&[], &["name"], None)]).unwrap(),
+            skill("base: &b {a: 1}\nmetadata:\n  <<: *b\n  c: 2\n")
         );
     }
 

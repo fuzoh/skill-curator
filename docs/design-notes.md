@@ -292,7 +292,9 @@ reference. Choices made there:
   Every edit is parsed again and refused unless it yields exactly the
   expected entries, so an edit that would change an untouched entry (for
   example through a shared anchor) is refused. Frontmatter with several
-  documents, duplicate or non-scalar top-level keys, or nesting deeper than
+  documents, duplicate or non-scalar top-level keys, a top-level YAML merge
+  key (`<<`, or a key tagged `!!merge`, which merge-aware readers expand into
+  top-level keys a `remove` rule could not see), or nesting deeper than
   64 levels is refused too. Aliases are compared by the node they resolve
   to (redefined anchors included), and frontmatter that would exceed
   100,000 nodes once its aliases are resolved is refused. Lines end at

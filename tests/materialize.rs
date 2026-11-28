@@ -1100,3 +1100,26 @@ fn frontmatter_the_rules_cannot_edit_is_accepted_and_kept() -> TestResult {
     assert_eq!(fixture.read("grill-me", "SKILL.md")?, UPSTREAM_SKILL_MD);
     Ok(())
 }
+
+#[test]
+fn accepting_a_frontmatter_merge_key_warns() -> TestResult {
+    let fixture = Fixture::new()?;
+    // `grilling` removes `icon`; a merge-aware YAML reader reads it back
+    // from the merge.
+    let edited = fixture.read("grilling", "SKILL.md")?.replacen(
+        "version: 1\n",
+        "version: 1\n<<: {icon: flame}\n",
+        1,
+    );
+    fs::write(fixture.skill("grilling").join("SKILL.md"), &edited)?;
+    fixture.delete_upstream()?;
+    fixture
+        .materialize(&["--accept", "grilling"])
+        .success()
+        .stdout(predicate::str::contains(
+            "grilling: accepted the manual edits in skills/grilling/ into lock.toml; warning: SKILL.md no longer satisfies the Skill's frontmatter rules (D1)",
+        ));
+    assert_eq!(fixture.read("grilling", "SKILL.md")?, edited);
+    fixture.assert_lock_matches("grilling")?;
+    Ok(())
+}
