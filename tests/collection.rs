@@ -8,8 +8,9 @@ use std::os::unix::fs::symlink;
 use std::path::Path;
 
 use skill_curator::collection::lock::{LOCK_FORMAT, Lock, LockedSkill};
-use skill_curator::collection::{Collection, CollectionError};
+use skill_curator::collection::{Collection, CollectionError, load_machine_config};
 use skill_curator::hash::HashError;
+use skill_curator::rewrite::Agent;
 use skill_curator::safety::{HomeDir, Name};
 use tempfile::TempDir;
 
@@ -441,6 +442,31 @@ fn missing_machine_config_keeps_portable_destinations() -> TestResult {
             .map(|i| i.file.clone()),
         Some(home.join(".claude/CLAUDE.md"))
     );
+    Ok(())
+}
+
+#[test]
+fn machine_config_chooses_the_rewrite_agent() -> TestResult {
+    let dir = TempDir::new()?;
+    let machine = dir.path().join("machine.toml");
+    assert_eq!(load_machine_config(&machine)?.agent, None);
+    assert_eq!(
+        Agent::select(None, load_machine_config(&machine)?.agent),
+        Agent::Pi
+    );
+    fs::write(&machine, "agent = \"claude\"\n")?;
+    let configured = load_machine_config(&machine)?.agent;
+    assert_eq!(configured, Some(Agent::Claude));
+    assert_eq!(Agent::select(None, configured), Agent::Claude);
+    assert_eq!(
+        Agent::select(Some(Agent::Manual), configured),
+        Agent::Manual
+    );
+    fs::write(&machine, "agent = \"codex\"\n")?;
+    let err = load_machine_config(&machine)
+        .err()
+        .ok_or("an unknown agent must be refused")?;
+    assert!(matches!(err, CollectionError::Parse { .. }), "{err}");
     Ok(())
 }
 

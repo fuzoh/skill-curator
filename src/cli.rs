@@ -11,6 +11,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::Error;
 use crate::collection::Collection;
 use crate::materialize::{self, Options};
+use crate::rewrite::Agent;
 use crate::safety::{HomeDir, Name, PathError};
 use crate::source::{Git, SourceCache};
 
@@ -42,7 +43,7 @@ pub enum Command {
     Check,
     /// Move Skills to new Revisions, reviewing agent-assisted changes one Skill
     /// at a time.
-    Update,
+    Update(UpdateArgs),
     /// Replay local Adaptation and Composition changes at the pinned Revision,
     /// without fetching.
     Materialize(MaterializeArgs),
@@ -63,6 +64,41 @@ pub struct MaterializeArgs {
     pub reset: Vec<Name>,
 }
 
+/// Options of `update`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct UpdateArgs {
+    /// Who performs agent-assisted rewrites.
+    #[command(flatten)]
+    pub agent: AgentArgs,
+}
+
+/// Choice of the agent that performs agent-assisted rewrites. Without a
+/// flag, the `agent` setting of machine.toml applies, else `pi`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct AgentArgs {
+    /// Agent that performs agent-assisted rewrites, started in each staging
+    /// directory [default: the `agent` setting of machine.toml, else pi]
+    #[arg(long, value_enum, value_name = "AGENT")]
+    pub agent: Option<Agent>,
+    /// Perform agent-assisted rewrites yourself: print each staging directory
+    /// and wait for confirmation instead of starting an agent (same as
+    /// `--agent manual`)
+    #[arg(long, conflicts_with = "agent")]
+    pub manual: bool,
+}
+
+impl AgentArgs {
+    /// The agent chosen on the command line, if any.
+    #[must_use]
+    pub fn choice(&self) -> Option<Agent> {
+        if self.manual {
+            Some(Agent::Manual)
+        } else {
+            self.agent
+        }
+    }
+}
+
 fn parse_name(raw: &str) -> Result<Name, PathError> {
     Name::new(raw)
 }
@@ -74,7 +110,7 @@ impl Command {
         match self {
             Self::Status => "status",
             Self::Check => "check",
-            Self::Update => "update",
+            Self::Update(_) => "update",
             Self::Materialize(_) => "materialize",
             Self::Install => "install",
         }
@@ -190,7 +226,7 @@ mod tests {
         let named = [
             Command::Status,
             Command::Check,
-            Command::Update,
+            Command::Update(UpdateArgs::default()),
             Command::Materialize(MaterializeArgs::default()),
             Command::Install,
         ]
@@ -205,6 +241,38 @@ mod tests {
             run(&cli),
             Err(Error::NotImplemented { command: "status" })
         ));
+    }
+
+    #[test]
+    fn update_chooses_the_agent() {
+        let choice = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Update(update) = cli.command else {
+                panic!("not update");
+            };
+            update.agent.choice()
+        };
+        assert_eq!(choice(&["skill-curator", "update"]), None);
+        assert_eq!(
+            choice(&["skill-curator", "update", "--agent", "claude"]),
+            Some(Agent::Claude)
+        );
+        assert_eq!(
+            choice(&["skill-curator", "update", "--agent", "pi"]),
+            Some(Agent::Pi)
+        );
+        assert_eq!(
+            choice(&["skill-curator", "update", "--manual"]),
+            Some(Agent::Manual)
+        );
+        assert_eq!(
+            choice(&["skill-curator", "update", "--agent", "manual"]),
+            Some(Agent::Manual)
+        );
+        assert!(Cli::try_parse_from(["skill-curator", "update", "--agent", "codex"]).is_err());
+        assert!(
+            Cli::try_parse_from(["skill-curator", "update", "--manual", "--agent", "pi"]).is_err()
+        );
     }
 
     #[test]

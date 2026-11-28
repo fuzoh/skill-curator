@@ -1,5 +1,6 @@
 //! `machine.toml`: optional, uncommitted, machine-local settings that enable,
-//! disable, or relocate the Manifest's portable Destinations on one machine.
+//! disable, or relocate the Manifest's portable Destinations on one machine,
+//! and choose the agent that performs agent-assisted rewrites there.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Problem;
 use super::manifest::{FrontmatterRules, Harness, Manifest, no_skills_dir_problem};
+use crate::rewrite::Agent;
 use crate::safety::{HomeDir, InstallPath, Name, RelativePath};
 
 /// Parsed `machine.toml`. An absent file is the default: every Destination
@@ -16,6 +18,11 @@ use crate::safety::{HomeDir, InstallPath, Name, RelativePath};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MachineConfig {
+    /// Agent performing agent-assisted rewrites on this machine (`pi`,
+    /// `claude`, or `manual`); `pi` when absent. A command-line choice takes
+    /// precedence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<Agent>,
     /// Machine-local settings per Destination, by Destination name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub destinations: BTreeMap<Name, MachineDestination>,
@@ -333,6 +340,8 @@ skills_dir = "/srv/agents/skills"
     #[test]
     fn parses_and_round_trips() {
         let text = r#"
+agent = "claude"
+
 [destinations.claude]
 enabled = false
 
@@ -341,6 +350,7 @@ skills_dir = "/opt/pi/skills"
 instruction_file = "~/pi/AGENTS.md"
 "#;
         let machine = MachineConfig::from_toml(text).unwrap();
+        assert_eq!(machine.agent, Some(Agent::Claude));
         let pi = &machine.destinations[&Name::new("pi").unwrap()];
         assert_eq!(pi.enabled, None);
         assert_eq!(pi.skills_dir.as_ref().unwrap().as_str(), "/opt/pi/skills");
@@ -366,6 +376,7 @@ instruction_file = "~/pi/AGENTS.md"
             ),
             ("[destinations.pi]\nenabled = 'no'\n", "expected a boolean"),
             ("[hosts.bnd]\n", "unknown field `hosts`"),
+            ("agent = 'codex'\n", "unknown variant `codex`"),
         ] {
             let err = MachineConfig::from_toml(text).unwrap_err().to_string();
             assert!(err.contains(expected), "{text}\n=> {err}");
@@ -374,6 +385,7 @@ instruction_file = "~/pi/AGENTS.md"
 
     #[test]
     fn missing_settings_keep_portable_defaults() {
+        assert_eq!(MachineConfig::from_toml("").unwrap().agent, None);
         let resolved = resolve("").unwrap();
         let names = resolved
             .iter()

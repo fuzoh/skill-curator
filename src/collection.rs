@@ -260,11 +260,7 @@ impl Collection {
         machine_config: &Path,
         home: &HomeDir,
     ) -> Result<Vec<ResolvedDestination>, CollectionError> {
-        let machine = match read_optional(machine_config)? {
-            Some(text) => parse(machine_config, &text, MachineConfig::from_toml)?,
-            None => MachineConfig::default(),
-        };
-        machine
+        load_machine_config(machine_config)?
             .resolve(&self.manifest, home, &self.root_forms()?)
             .map_err(|problems| CollectionError::Invalid {
                 path: machine_config.to_path_buf(),
@@ -433,6 +429,20 @@ impl Collection {
 struct Inputs<'a> {
     skill: &'a Skill,
     presets: Vec<&'a Preset>,
+}
+
+/// Reads `machine.toml` at `path`; a missing file means no machine-local
+/// settings.
+///
+/// # Errors
+///
+/// Returns a [`CollectionError`] when the file exists but cannot be read or
+/// parsed.
+pub fn load_machine_config(path: &Path) -> Result<MachineConfig, CollectionError> {
+    match read_optional(path)? {
+        Some(text) => parse(path, &text, MachineConfig::from_toml),
+        None => Ok(MachineConfig::default()),
+    }
 }
 
 /// Reads `lock.toml`, or returns an empty lock when the file is absent.
