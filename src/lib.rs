@@ -11,6 +11,7 @@ pub mod diff;
 mod error;
 pub mod hash;
 pub mod materialize;
+pub mod rewrite;
 pub mod safety;
 pub mod source;
 

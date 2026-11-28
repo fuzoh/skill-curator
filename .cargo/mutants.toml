@@ -33,6 +33,12 @@ examine_globs = [
     # Overwrite protection of manual edits in `skills/` and the staged swap
     # of Skill directories.
     "src/materialize.rs",
+    # Agent rewrite handoff: refusal of symbolic links, hard links, special
+    # files, and unsafe paths in the agent's `output/`, the `SKILL.md` and
+    # frontmatter checks, D1 re-enforcement, and read-only reference views
+    # whose removal never follows a link out of the staging directory.
+    "src/rewrite/output.rs",
+    "src/rewrite/staging.rs",
     # Update conflict handling.
     "src/conflict.rs",
     "src/conflict/**/*.rs",

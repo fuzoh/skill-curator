@@ -1,0 +1,762 @@
+//! Agent rewrite handoff: the staging directory layout, mock agent runners
+//! (shell scripts standing in for `pi` and `claude`), validation of the
+//! proposed Skill, and manual mode. Nothing here starts a real agent or
+//! touches the network; every runner is a script written into a temporary
+//! directory.
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::fs;
+use std::io::{self, BufRead, Cursor, Read, Write};
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+use skill_curator::adaptation::{SkillFile, SkillTree};
+use skill_curator::collection::manifest::FrontmatterRules;
+use skill_curator::diff::Change;
+use skill_curator::rewrite::{
+    AGENT_PROMPT, Agent, InputRevisions, Inputs, Job, OutputError, Proposal, RewriteError, Runner,
+    Staging, rewrite,
+};
+use skill_curator::safety::{Name, RelativePath};
+use tempfile::TempDir;
+
+type TestResult = Result<(), Box<dyn Error>>;
+
+const BASE_SKILL_MD: &str = "---\nname: grill-me\ndescription: Grill the user.\nicon: flame\n---\n# Grill me\n\nAsk one question at a time.\n";
+const UPSTREAM_SKILL_MD: &str = "---\nname: grill-me\ndescription: Grill the user.\nicon: flame\n---\n# Grill me\n\nAsk one question at a time.\nWait for each answer.\n";
+const CURRENT_SKILL_MD: &str = "---\nname: grilling\ndescription: Grill the user.\n---\n# Grill me\n\nAsk one question at a time, in the user's voice.\n";
+const INTENT: &str = "Answer in the user's voice.\n";
+
+fn tree(files: &[(&str, &str)]) -> Result<SkillTree, Box<dyn Error>> {
+    let mut tree = SkillTree::default();
+    for (path, contents) in files {
+        tree.insert(
+            RelativePath::exact(path)?,
+            SkillFile {
+                contents: contents.as_bytes().to_vec(),
+                executable: path.ends_with(".sh"),
+            },
+        );
+    }
+    Ok(tree)
+}
+
+/// D1 rules of the rewritten Skill: `icon` removed, `name` set.
+fn frontmatter() -> Result<Vec<FrontmatterRules>, Box<dyn Error>> {
+    Ok(vec![
+        toml::from_str("remove = [\"icon\"]")?,
+        toml::from_str("set = { name = \"grilling\" }")?,
+    ])
+}
+
+fn adaptation_job(base: bool) -> Result<Job, Box<dyn Error>> {
+    Ok(Job {
+        skill: Name::new("grilling")?,
+        inputs: Inputs::Adaptation {
+            base: if base {
+                Some(tree(&[
+                    ("SKILL.md", BASE_SKILL_MD),
+                    ("references/old.md", "old\n"),
+                ])?)
+            } else {
+                None
+            },
+            upstream: tree(&[
+                ("SKILL.md", UPSTREAM_SKILL_MD),
+                ("scripts/run.sh", "#!/bin/sh\necho hi\n"),
+            ])?,
+        },
+        current: Some(tree(&[("SKILL.md", CURRENT_SKILL_MD)])?),
+        intent: Some(INTENT.to_owned()),
+        frontmatter: frontmatter()?,
+        guidance: None,
+    })
+}
+
+fn composition_job(current: bool) -> Result<Job, Box<dyn Error>> {
+    let inputs = BTreeMap::from([
+        (
+            Name::new("asker")?,
+            InputRevisions {
+                old: Some(tree(&[("SKILL.md", BASE_SKILL_MD)])?),
+                new: tree(&[("SKILL.md", UPSTREAM_SKILL_MD)])?,
+            },
+        ),
+        (
+            Name::new("reviewer")?,
+            InputRevisions {
+                old: Some(tree(&[("SKILL.md", "---\nname: review\n---\nReview.\n")])?),
+                new: tree(&[("SKILL.md", "---\nname: review\n---\nReview.\n")])?,
+            },
+        ),
+        (
+            Name::new("writer")?,
+            InputRevisions {
+                old: None,
+                new: tree(&[("SKILL.md", "---\nname: write\n---\nWrite.\n")])?,
+            },
+        ),
+    ]);
+    Ok(Job {
+        skill: Name::new("paired")?,
+        inputs: Inputs::Composition(inputs),
+        current: if current {
+            Some(tree(&[("SKILL.md", "---\nname: paired\n---\nPaired.\n")])?)
+        } else {
+            None
+        },
+        intent: Some("Combine asking and reviewing.\n".to_owned()),
+        frontmatter: vec![toml::from_str(
+            "keep_only = [\"name\", \"description\"]\nset = { name = \"paired\" }",
+        )?],
+        guidance: None,
+    })
+}
+
+fn read(path: &Path) -> Result<String, Box<dyn Error>> {
+    Ok(fs::read_to_string(path)?)
+}
+
+fn mode(path: &Path) -> Result<u32, Box<dyn Error>> {
+    Ok(fs::symlink_metadata(path)?.permissions().mode() & 0o777)
+}
+
+/// Asserts that `dir` holds exactly `expected` and that nothing can be
+/// written into it.
+fn assert_read_only_view(dir: &Path, expected: &SkillTree) -> TestResult {
+    assert_eq!(&SkillTree::read(dir)?, expected, "{}", dir.display());
+    assert_eq!(mode(dir)? & 0o222, 0, "{} is writable", dir.display());
+    assert!(fs::write(dir.join("new.md"), "x").is_err());
+    for path in expected.paths() {
+        assert_eq!(mode(&path.join_to(dir))? & 0o222, 0, "{path} is writable");
+    }
+    Ok(())
+}
+
+#[test]
+fn three_way_adaptation_staging_layout() -> TestResult {
+    let job = adaptation_job(true)?;
+    let Inputs::Adaptation {
+        base: Some(base),
+        upstream,
+    } = job.inputs.clone()
+    else {
+        panic!("not a three-way Adaptation");
+    };
+    let current = job.current.clone().ok_or("no current")?;
+    let staging = Staging::create(job)?;
+    let root = staging.path();
+
+    assert_read_only_view(&root.join("base"), &base)?;
+    assert_read_only_view(&root.join("upstream"), &upstream)?;
+    assert_read_only_view(&root.join("current"), &current)?;
+    assert!(!root.join("inputs").exists());
+    // `output/` starts as accepted_local and is writable.
+    assert_eq!(SkillTree::read(&staging.output_dir())?, current);
+    fs::write(staging.output_dir().join("new.md"), "x")?;
+
+    let diff = read(&root.join("diffs/upstream.diff"))?;
+    assert!(
+        diff.contains("--- base/SKILL.md\n+++ upstream/SKILL.md\n"),
+        "{diff}"
+    );
+    assert!(diff.contains("+Wait for each answer.\n"), "{diff}");
+    assert!(
+        diff.contains("--- base/references/old.md\n+++ /dev/null\n"),
+        "{diff}"
+    );
+
+    let brief = read(&root.join("BRIEF.md"))?;
+    assert_eq!(mode(&root.join("BRIEF.md"))? & 0o222, 0);
+    for expected in [
+        "# Rewrite brief: Skill `grilling`",
+        "an Adaptation of one upstream Skill",
+        "## Written intent",
+        INTENT,
+        "- `upstream/`:",
+        "- `base/`:",
+        "- `current/`:",
+        "- `diffs/upstream.diff`:",
+        "never run the scripts it holds",
+        "- modified: `SKILL.md`",
+        "- removed: `references/old.md`",
+        "- added: `scripts/run.sh`",
+        "Rule set 1:\n- remove `icon`\nRule set 2:\n- set `name` to `\"grilling\"`\n",
+        "`output/` starts as a copy of `current/`",
+        "`output/SKILL.md` is required",
+    ] {
+        assert!(brief.contains(expected), "missing {expected:?} in\n{brief}");
+    }
+    assert!(!brief.contains("two-way"), "{brief}");
+    assert!(!brief.contains("## Extra guidance"), "{brief}");
+    Ok(())
+}
+
+#[test]
+fn two_way_adaptation_staging_layout() -> TestResult {
+    let mut job = adaptation_job(false)?;
+    job.current = None;
+    job.guidance = Some("Keep the examples.".to_owned());
+    let Inputs::Adaptation { upstream, .. } = job.inputs.clone() else {
+        panic!("not an Adaptation");
+    };
+    let staging = Staging::create(job)?;
+    let root = staging.path();
+
+    assert_read_only_view(&root.join("upstream"), &upstream)?;
+    assert!(!root.join("base").exists());
+    assert!(!root.join("current").exists());
+    assert!(!root.join("diffs").exists());
+    // Without accepted_local, `output/` starts as det(R_new).
+    assert_eq!(SkillTree::read(&staging.output_dir())?, upstream);
+    fs::write(staging.output_dir().join("SKILL.md"), "edited")?;
+
+    let brief = read(&root.join("BRIEF.md"))?;
+    for expected in [
+        "There is no `base/`",
+        "This is a two-way comparison",
+        "There is no `current/`",
+        "Unknown: the Revision the accepted Skill was produced from is unavailable.",
+        "## Extra guidance\n\nThe user reviewed an earlier proposal and asks for this:\n\nKeep the examples.\n",
+        "`output/` starts as a copy of `upstream/`",
+    ] {
+        assert!(brief.contains(expected), "missing {expected:?} in\n{brief}");
+    }
+    assert!(!brief.contains("- `base/`:"), "{brief}");
+    Ok(())
+}
+
+#[test]
+fn composition_staging_layout() -> TestResult {
+    let job = composition_job(true)?;
+    let Inputs::Composition(inputs) = job.inputs.clone() else {
+        panic!("not a Composition");
+    };
+    let current = job.current.clone().ok_or("no current")?;
+    let staging = Staging::create(job)?;
+    let root = staging.path();
+
+    for (name, revisions) in &inputs {
+        assert_read_only_view(&root.join("inputs").join(name.as_str()), &revisions.new)?;
+    }
+    assert_eq!(mode(&root.join("inputs"))? & 0o222, 0);
+    assert_read_only_view(&root.join("current"), &current)?;
+    assert!(!root.join("base").exists());
+    assert!(!root.join("upstream").exists());
+    assert_eq!(SkillTree::read(&staging.output_dir())?, current);
+
+    // A diff per changed input; none for an unchanged input or one whose
+    // old Revision is unavailable.
+    let diff = read(&root.join("diffs/asker.diff"))?;
+    assert!(
+        diff.contains("--- old/SKILL.md\n+++ new/SKILL.md\n"),
+        "{diff}"
+    );
+    assert!(diff.contains("+Wait for each answer.\n"), "{diff}");
+    assert!(!root.join("diffs/reviewer.diff").exists());
+    assert!(!root.join("diffs/writer.diff").exists());
+
+    let brief = read(&root.join("BRIEF.md"))?;
+    for expected in [
+        "a Composition of 3 upstream Skills (inputs `asker`, `reviewer`, `writer`)",
+        "Combine asking and reviewing.\n",
+        "- `inputs/asker/`:",
+        "- `diffs/asker.diff`:",
+        "- `inputs/reviewer/`:",
+        "- `inputs/writer/`:",
+        "### Input `asker`\n\nChanged files (full diff in `diffs/asker.diff`):\n\n- modified: `SKILL.md`\n",
+        "### Input `reviewer`\n\nNone since the Revision",
+        "### Input `writer`\n\nUnknown:",
+        "- keep only `name`, `description`\n- set `name` to `\"paired\"`\n",
+    ] {
+        assert!(brief.contains(expected), "missing {expected:?} in\n{brief}");
+    }
+    assert!(!brief.contains("`diffs/reviewer.diff`"), "{brief}");
+    assert!(!brief.contains("Rule set 1"), "{brief}");
+    Ok(())
+}
+
+#[test]
+fn first_composition_starts_with_an_empty_output() -> TestResult {
+    let staging = Staging::create(composition_job(false)?)?;
+    assert_eq!(fs::read_dir(staging.output_dir())?.count(), 0);
+    assert!(!staging.path().join("current").exists());
+    let brief = read(&staging.path().join("BRIEF.md"))?;
+    assert!(brief.contains("`output/` starts as empty"), "{brief}");
+    Ok(())
+}
+
+#[test]
+fn staging_directory_is_removed_when_dropped() -> TestResult {
+    let staging = Staging::create(adaptation_job(true)?)?;
+    let root = staging.path().to_path_buf();
+    drop(staging);
+    assert!(!root.exists());
+    Ok(())
+}
+
+/// A temporary directory holding mock agent scripts and the files they
+/// record.
+struct Mock {
+    dir: TempDir,
+}
+
+impl Mock {
+    fn new() -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            dir: TempDir::new()?,
+        })
+    }
+
+    /// Writes an executable script whose body runs in the staging directory.
+    /// It records its working directory and first argument first.
+    fn script(&self, name: &str, body: &str) -> Result<PathBuf, Box<dyn Error>> {
+        let path = self.dir.path().join(name);
+        let record = self.dir.path().display();
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nset -e\npwd > '{record}/cwd'\nprintf '%s' \"$1\" > '{record}/prompt'\n{body}\n"
+            ),
+        )?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        Ok(path)
+    }
+
+    fn recorded(&self, file: &str) -> Result<String, Box<dyn Error>> {
+        read(&self.dir.path().join(file))
+    }
+
+    fn has_recorded(&self, file: &str) -> bool {
+        self.dir.path().join(file).exists()
+    }
+}
+
+fn run_script(agent: Agent, script: &Path, job: Job) -> Result<Proposal, RewriteError> {
+    let runner = Runner::new(agent).with_program(script);
+    let mut terminal_out = Vec::new();
+    rewrite(
+        job,
+        &runner,
+        &mut Cursor::new(Vec::new()),
+        &mut terminal_out,
+    )
+}
+
+#[test]
+fn mock_agent_rewrite_succeeds() -> TestResult {
+    let mock = Mock::new()?;
+    let script = mock.script(
+        "pi",
+        "test -r BRIEF.md\nprintf 'Wait for each answer.\\n' >> output/SKILL.md\nmkdir output/references\nprintf 'guide\\n' > output/references/guide.md",
+    )?;
+    let proposal = run_script(Agent::Pi, &script, adaptation_job(true)?)?;
+
+    assert_eq!(mock.recorded("prompt")?, AGENT_PROMPT);
+    let staging = PathBuf::from(mock.recorded("cwd")?.trim());
+    assert!(
+        staging
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("skill-curator-rewrite-")),
+        "{}",
+        staging.display()
+    );
+    assert!(!staging.exists(), "the staging directory is removed");
+
+    let expected = format!("{CURRENT_SKILL_MD}Wait for each answer.\n");
+    assert_eq!(proposal.skill.skill_md()?, expected);
+    assert!(!proposal.frontmatter_enforced);
+    assert_eq!(
+        proposal
+            .diff
+            .changes()
+            .map(|(path, change)| (path.as_str().to_owned(), change))
+            .collect::<Vec<_>>(),
+        [
+            ("SKILL.md".to_owned(), Change::Modified),
+            ("references/guide.md".to_owned(), Change::Added),
+        ]
+    );
+    let rendered = proposal.diff.to_string();
+    assert!(
+        rendered.contains("--- current/SKILL.md\n+++ output/SKILL.md\n"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("+Wait for each answer.\n"), "{rendered}");
+    Ok(())
+}
+
+#[test]
+fn claude_runner_starts_its_program_with_the_same_prompt() -> TestResult {
+    let mock = Mock::new()?;
+    let script = mock.script("claude", "printf 'More.\\n' >> output/SKILL.md")?;
+    let proposal = run_script(Agent::Claude, &script, composition_job(true)?)?;
+    assert_eq!(mock.recorded("prompt")?, AGENT_PROMPT);
+    assert_eq!(
+        proposal.skill.skill_md()?,
+        "---\nname: paired\n---\nPaired.\nMore.\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn locked_frontmatter_keys_are_enforced_again() -> TestResult {
+    let mock = Mock::new()?;
+    // The agent renames the Skill and brings back the removed `icon`.
+    let script = mock.script(
+        "pi",
+        "cat > output/SKILL.md <<'EOF'\n---\nname: renamed\ndescription: Grill the user, gently.\nicon: flame\n---\n# Grill me\n\nAsk gently.\nEOF",
+    )?;
+    let proposal = run_script(Agent::Pi, &script, adaptation_job(true)?)?;
+    assert!(proposal.frontmatter_enforced);
+    assert_eq!(
+        proposal.skill.skill_md()?,
+        "---\nname: grilling\ndescription: Grill the user, gently.\n---\n# Grill me\n\nAsk gently.\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn composition_frontmatter_invariants_are_enforced_again() -> TestResult {
+    let mock = Mock::new()?;
+    let script = mock.script(
+        "pi",
+        "printf -- '---\\nname: other\\nextra: 1\\ndescription: D.\\n---\\nBody\\n' > output/SKILL.md",
+    )?;
+    let proposal = run_script(Agent::Pi, &script, composition_job(false)?)?;
+    assert!(proposal.frontmatter_enforced);
+    assert_eq!(
+        proposal.skill.skill_md()?,
+        "---\nname: paired\ndescription: D.\n---\nBody\n"
+    );
+    // Without accepted_local, every file is new.
+    assert!(
+        proposal
+            .diff
+            .changes()
+            .all(|(_, change)| change == Change::Added)
+    );
+    Ok(())
+}
+
+fn rejected(body: &str, job: Job) -> Result<OutputError, Box<dyn Error>> {
+    let mock = Mock::new()?;
+    let script = mock.script("pi", body)?;
+    match run_script(Agent::Pi, &script, job) {
+        Err(RewriteError::Output(err)) => {
+            let staging = PathBuf::from(mock.recorded("cwd")?.trim());
+            assert!(!staging.exists(), "the staging directory is removed");
+            Ok(err)
+        }
+        Err(err) => Err(format!("unexpected error: {err}").into()),
+        Ok(proposal) => Err(format!("accepted: {:?}", proposal.skill).into()),
+    }
+}
+
+#[test]
+fn missing_skill_md_is_rejected() -> TestResult {
+    let err = rejected("rm output/SKILL.md", adaptation_job(true)?)?;
+    assert!(matches!(err, OutputError::MissingSkillFile), "{err}");
+    assert_eq!(err.to_string(), "`output/SKILL.md` is missing");
+    // An empty first Composition left untouched has no SKILL.md either.
+    let err = rejected("true", composition_job(false)?)?;
+    assert!(matches!(err, OutputError::MissingSkillFile), "{err}");
+    Ok(())
+}
+
+#[test]
+fn invalid_yaml_frontmatter_is_rejected() -> TestResult {
+    let err = rejected(
+        "printf -- '---\\nname: [grilling\\n---\\nBody\\n' > output/SKILL.md",
+        adaptation_job(true)?,
+    )?;
+    assert!(matches!(err, OutputError::InvalidFrontmatter(_)), "{err}");
+    assert!(err.to_string().contains("not valid YAML"), "{err}");
+
+    let err = rejected(
+        "printf -- '---\\nname: grilling\\nBody\\n' > output/SKILL.md",
+        adaptation_job(true)?,
+    )?;
+    assert!(matches!(err, OutputError::InvalidFrontmatter(_)), "{err}");
+
+    let err = rejected(
+        "printf '# No frontmatter\\n' > output/SKILL.md",
+        adaptation_job(true)?,
+    )?;
+    assert!(matches!(err, OutputError::NoFrontmatter), "{err}");
+    Ok(())
+}
+
+#[test]
+fn symlinks_and_path_traversal_are_rejected() -> TestResult {
+    let outside = TempDir::new()?;
+    let secret = outside.path().join("secret");
+    fs::write(&secret, "secret")?;
+    let secret = secret.display();
+
+    let err = rejected(
+        &format!("ln -s '{secret}' output/notes.md"),
+        adaptation_job(true)?,
+    )?;
+    assert!(
+        matches!(&err, OutputError::Symlink { path } if path == "notes.md"),
+        "{err}"
+    );
+
+    let err = rejected(
+        "mkdir output/references\nln -s ../../.. output/references/up",
+        adaptation_job(true)?,
+    )?;
+    assert!(
+        matches!(&err, OutputError::Symlink { path } if path == "references/up"),
+        "{err}"
+    );
+
+    let err = rejected(
+        "mv output real-output\nln -s real-output output",
+        adaptation_job(true)?,
+    )?;
+    assert!(matches!(err, OutputError::NotADirectory), "{err}");
+
+    let err = rejected(
+        &format!("ln '{secret}' output/copy.md"),
+        adaptation_job(true)?,
+    )?;
+    assert!(
+        matches!(&err, OutputError::HardLink { path } if path == "copy.md"),
+        "{err}"
+    );
+
+    let err = rejected("mkdir -p output/.git/hooks", adaptation_job(true)?)?;
+    assert!(matches!(err, OutputError::UnsafePath { .. }), "{err}");
+    Ok(())
+}
+
+#[test]
+fn reference_views_cannot_be_modified_by_the_agent() -> TestResult {
+    let mock = Mock::new()?;
+    let script = mock.script(
+        "pi",
+        &format!(
+            "if {{ printf x > upstream/SKILL.md || printf x > base/new.md || printf x > BRIEF.md; }} 2>/dev/null; then touch '{}/wrote'; fi",
+            mock.dir.path().display()
+        ),
+    )?;
+    run_script(Agent::Pi, &script, adaptation_job(true)?)?;
+    assert!(!mock.has_recorded("wrote"));
+    Ok(())
+}
+
+#[test]
+fn non_zero_runner_exit_status_is_reported_and_cleaned_up() -> TestResult {
+    let mock = Mock::new()?;
+    let script = mock.script("pi", "printf 'Half done.\\n' >> output/SKILL.md\nexit 3")?;
+    let err = run_script(Agent::Pi, &script, adaptation_job(true)?).map(|_| ());
+    let Err(RewriteError::AgentFailed { agent, status }) = err else {
+        return Err(format!("unexpected outcome: {err:?}").into());
+    };
+    assert_eq!(agent, Agent::Pi);
+    assert_eq!(status.code(), Some(3));
+    let message = RewriteError::AgentFailed { agent, status }.to_string();
+    assert!(
+        message.starts_with("pi failed (exit status: 3)"),
+        "{message}"
+    );
+    let staging = PathBuf::from(mock.recorded("cwd")?.trim());
+    assert!(!staging.exists(), "the staging directory is removed");
+    Ok(())
+}
+
+#[test]
+fn a_missing_agent_binary_is_reported() -> TestResult {
+    let missing = TempDir::new()?;
+    let program = missing.path().join("claude");
+    let err = run_script(Agent::Claude, &program, adaptation_job(true)?).map(|_| ());
+    let Err(err @ RewriteError::Spawn { .. }) = err else {
+        return Err(format!("unexpected outcome: {err:?}").into());
+    };
+    let message = err.to_string();
+    assert!(message.starts_with("cannot start claude"), "{message}");
+    assert!(message.contains("--manual"), "{message}");
+    Ok(())
+}
+
+/// What the user does in the staging directory before confirming.
+type UserEdit = Box<dyn FnOnce(&Path)>;
+
+/// The terminal of a manual rewrite: everything printed is kept, and the
+/// first read plays the user, who edits the staging directory named in the
+/// printed text and then answers.
+struct ManualUser {
+    printed: Rc<RefCell<Vec<u8>>>,
+    answers: Cursor<Vec<u8>>,
+    edit: Option<UserEdit>,
+}
+
+impl ManualUser {
+    fn act(&mut self) {
+        let Some(edit) = self.edit.take() else {
+            return;
+        };
+        let printed = String::from_utf8_lossy(&self.printed.borrow()).into_owned();
+        let Some(dir) = printed
+            .lines()
+            .find_map(|line| line.split_once("`: ").map(|(_, dir)| dir.to_owned()))
+        else {
+            return;
+        };
+        edit(Path::new(&dir));
+    }
+}
+
+impl Read for ManualUser {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.act();
+        self.answers.read(buf)
+    }
+}
+
+impl BufRead for ManualUser {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.act();
+        self.answers.fill_buf()
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.answers.consume(amount);
+    }
+}
+
+struct Printed(Rc<RefCell<Vec<u8>>>);
+
+impl Write for Printed {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn run_manual(
+    answers: &str,
+    edit: Option<UserEdit>,
+    runner: &Runner,
+) -> (Result<Proposal, RewriteError>, String) {
+    let printed = Rc::new(RefCell::new(Vec::new()));
+    let mut user = ManualUser {
+        printed: Rc::clone(&printed),
+        answers: Cursor::new(answers.as_bytes().to_vec()),
+        edit,
+    };
+    let job = match adaptation_job(true) {
+        Ok(job) => job,
+        Err(err) => {
+            return (
+                Err(RewriteError::Terminal(io::Error::other(err.to_string()))),
+                String::new(),
+            );
+        }
+    };
+    let result = rewrite(job, runner, &mut user, &mut Printed(Rc::clone(&printed)));
+    let text = String::from_utf8_lossy(&printed.borrow()).into_owned();
+    (result, text)
+}
+
+#[test]
+fn manual_mode_prints_the_staging_directory_and_resumes_on_confirmation() -> TestResult {
+    // The `pi` program is a trap: manual mode must not start it.
+    let mock = Mock::new()?;
+    let trap = mock.script("pi", "printf 'Agent line.\\n' >> output/SKILL.md")?;
+    let runner = Runner::new(Agent::Manual).with_program(&trap);
+    let seen = Rc::new(RefCell::new(None));
+    let seen_by_user = Rc::clone(&seen);
+    let edit: UserEdit = Box::new(move |dir: &Path| {
+        *seen_by_user.borrow_mut() = Some(dir.to_path_buf());
+        let skill_md = dir.join("output/SKILL.md");
+        if let Ok(mut text) = fs::read_to_string(&skill_md) {
+            text.push_str("Edited by hand.\n");
+            let _ = fs::write(&skill_md, text);
+        }
+    });
+    let (result, printed) = run_manual("\n", Some(edit), &runner);
+    let proposal = result?;
+
+    assert!(!mock.has_recorded("cwd"), "manual mode started an agent");
+    let dir = seen
+        .borrow()
+        .clone()
+        .ok_or("the staging directory was not printed")?;
+    assert!(
+        printed.contains(&format!(
+            "Staging directory for the rewrite of Skill `grilling`: {}\n",
+            dir.display()
+        )),
+        "{printed}"
+    );
+    assert!(
+        printed.contains(&format!("Read {}/BRIEF.md", dir.display())),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("Press Enter when the proposed Skill is ready"),
+        "{printed}"
+    );
+    assert!(!dir.exists(), "the staging directory is removed");
+    assert_eq!(
+        proposal.skill.skill_md()?,
+        format!("{CURRENT_SKILL_MD}Edited by hand.\n")
+    );
+    Ok(())
+}
+
+#[test]
+fn manual_mode_asks_again_after_an_unknown_answer() -> TestResult {
+    let runner = Runner::new(Agent::Manual);
+    let (result, printed) = run_manual("yes\n\n", None, &runner);
+    let proposal = result?;
+    assert!(printed.contains("Unknown answer `yes`."), "{printed}");
+    assert_eq!(printed.matches("Press Enter").count(), 2, "{printed}");
+    // Nothing changed: the proposal is accepted_local.
+    assert!(proposal.diff.is_empty());
+    Ok(())
+}
+
+#[test]
+fn manual_mode_can_be_stopped() -> TestResult {
+    for answers in ["abort\n", ""] {
+        let (result, _) = run_manual(answers, None, &Runner::new(Agent::Manual));
+        assert!(
+            matches!(result, Err(RewriteError::Aborted)),
+            "{answers:?}: {result:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn unchanged_upstream_skill_has_no_diff() -> TestResult {
+    let mut job = adaptation_job(true)?;
+    let upstream = tree(&[("SKILL.md", UPSTREAM_SKILL_MD)])?;
+    job.inputs = Inputs::Adaptation {
+        base: Some(upstream.clone()),
+        upstream,
+    };
+    let staging = Staging::create(job)?;
+    assert!(!staging.path().join("diffs").exists());
+    let brief = read(&staging.path().join("BRIEF.md"))?;
+    assert!(
+        brief.contains(
+            "## Upstream changes\n\nNone since the Revision the accepted Skill was produced from.\n"
+        ),
+        "{brief}"
+    );
+    assert!(!brief.contains("diffs/upstream.diff"), "{brief}");
+    Ok(())
+}
