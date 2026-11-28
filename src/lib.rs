@@ -7,6 +7,7 @@
 pub mod adaptation;
 pub mod cli;
 pub mod collection;
+pub mod diff;
 mod error;
 pub mod hash;
 pub mod materialize;
