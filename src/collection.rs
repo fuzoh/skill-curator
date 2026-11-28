@@ -17,16 +17,19 @@ pub mod lock;
 pub mod machine;
 pub mod manifest;
 
+use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
-use std::io;
+use std::fs::{self, Permissions};
+use std::io::{self, Write as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::adaptation::Rules;
 use crate::hash::{self, Digest, HashError};
 use crate::safety::{HomeDir, Name, RelativePath};
-use lock::{LOCK_FORMAT, Lock};
+use lock::{AppliedInputs, LOCK_FORMAT, Lock};
 use machine::{MachineConfig, ResolvedDestination};
 use manifest::{FRAGMENTS_DIR, INTENTS_DIR, Manifest, Preset, Skill};
 
@@ -309,11 +312,30 @@ impl Collection {
     /// Returns a [`CollectionError`] when the Skill is not declared or its
     /// intent cannot be read as a regular file of the Collection.
     pub fn inputs_digest(&self, name: &Name) -> Result<Option<Digest>, CollectionError> {
-        let skill = self
-            .manifest
-            .skills
-            .get(name)
-            .ok_or_else(|| CollectionError::UnknownSkill { name: name.clone() })?;
+        self.digest_inputs(name, true)
+    }
+
+    /// Hash of the inputs of Skill `name` as if it had no written intent:
+    /// what a Skill reset to its deterministic adaptation was produced from,
+    /// so that its intent still shows as an input change. Returns `None` for
+    /// local Skills.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CollectionError`] when the Skill is not declared.
+    pub fn inputs_digest_without_intent(
+        &self,
+        name: &Name,
+    ) -> Result<Option<Digest>, CollectionError> {
+        self.digest_inputs(name, false)
+    }
+
+    fn digest_inputs(
+        &self,
+        name: &Name,
+        with_intent: bool,
+    ) -> Result<Option<Digest>, CollectionError> {
+        let skill = self.declared(name)?;
         let manifest_path = || self.root.join(MANIFEST_FILE);
         let presets = match skill {
             Skill::Local(_) => return Ok(None),
@@ -337,23 +359,72 @@ impl Collection {
         if let Some(toml::Value::Table(declared)) = declaration.get_mut("skill") {
             declared.remove("presets");
         }
-        let intent = match skill.intent() {
-            Some(intent) => {
-                let location = format!("skills.{name}.intent");
-                if let Some(problem) =
-                    regular_file_problem(&self.root, intent, &location, "written intent")?
-                {
-                    return Err(CollectionError::Invalid {
-                        path: manifest_path(),
-                        problems: vec![problem],
-                    });
-                }
-                let path = intent.join_to(&self.root);
-                Some(fs::read(&path).map_err(|source| CollectionError::Read { path, source })?)
-            }
-            None => None,
+        let intent = if with_intent {
+            self.intent_bytes(name, skill)?
+        } else {
+            None
         };
         Ok(Some(hash::inputs_digest(&declaration, intent.as_deref())))
+    }
+
+    /// The effective rules and written intent digest of Skill `name`, as
+    /// recorded in `lock.toml` once its output is accepted. Returns `None`
+    /// for local Skills.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CollectionError`] when the Skill is not declared or its
+    /// intent cannot be read as a regular file of the Collection.
+    pub fn applied_inputs(&self, name: &Name) -> Result<Option<AppliedInputs>, CollectionError> {
+        let skill = self.declared(name)?;
+        if matches!(skill, Skill::Local(_)) {
+            return Ok(None);
+        }
+        let rules = Rules::of(&self.manifest, skill);
+        let inputs = match skill {
+            Skill::Composition(composition) => composition
+                .inputs
+                .iter()
+                .filter(|(_, input)| !input.files.is_empty())
+                .map(|(input_name, input)| (input_name.clone(), input.files.clone()))
+                .collect(),
+            Skill::Copy(_) | Skill::Adapt(_) | Skill::Local(_) => BTreeMap::new(),
+        };
+        Ok(Some(AppliedInputs {
+            intent_hash: self
+                .intent_bytes(name, skill)?
+                .map(|bytes| hash::intent_digest(&bytes)),
+            frontmatter: rules.frontmatter.into_iter().cloned().collect(),
+            files: rules.files.into_iter().cloned().collect(),
+            inputs,
+        }))
+    }
+
+    fn declared(&self, name: &Name) -> Result<&Skill, CollectionError> {
+        self.manifest
+            .skills
+            .get(name)
+            .ok_or_else(|| CollectionError::UnknownSkill { name: name.clone() })
+    }
+
+    /// The bytes of the written intent of `skill`, if it has one.
+    fn intent_bytes(&self, name: &Name, skill: &Skill) -> Result<Option<Vec<u8>>, CollectionError> {
+        let Some(intent) = skill.intent() else {
+            return Ok(None);
+        };
+        let location = format!("skills.{name}.intent");
+        if let Some(problem) =
+            regular_file_problem(&self.root, intent, &location, "written intent")?
+        {
+            return Err(CollectionError::Invalid {
+                path: self.root.join(MANIFEST_FILE),
+                problems: vec![problem],
+            });
+        }
+        let path = intent.join_to(&self.root);
+        fs::read(&path)
+            .map(Some)
+            .map_err(|source| CollectionError::Read { path, source })
     }
 }
 
@@ -398,9 +469,32 @@ fn load_lock(path: &Path) -> Result<Lock, CollectionError> {
     }
 }
 
+/// Writes `contents` to `root/file_name` through a temporary file renamed
+/// into place, so a failure never leaves the file half-written and a
+/// symbolic link at its path is replaced rather than followed. The file gets
+/// mode `0644`, as an ordinary Collection file.
+pub(crate) fn write_atomically(
+    root: &Path,
+    file_name: &str,
+    contents: &[u8],
+) -> Result<(), CollectionError> {
+    let path = root.join(file_name);
+    let write_error = |source| CollectionError::Write {
+        path: path.clone(),
+        source,
+    };
+    let mut file = tempfile::NamedTempFile::new_in(root).map_err(write_error)?;
+    file.write_all(contents).map_err(write_error)?;
+    file.as_file()
+        .set_permissions(Permissions::from_mode(0o644))
+        .map_err(write_error)?;
+    file.persist(&path).map_err(|err| write_error(err.error))?;
+    Ok(())
+}
+
 /// What a path inside the Collection names, found without following
 /// symbolic links below the Collection root.
-enum Entry {
+pub(crate) enum Entry {
     /// Nothing exists at the path.
     Missing,
     /// The path, or one of its parent directories below the root, is a
@@ -416,7 +510,7 @@ enum Entry {
 
 /// Walks `segments` down from `root`, checking each component with
 /// `symlink_metadata`, so that no link inside the Collection is followed.
-fn inspect(root: &Path, segments: &[&str]) -> Result<Entry, CollectionError> {
+pub(crate) fn inspect(root: &Path, segments: &[&str]) -> Result<Entry, CollectionError> {
     let mut path = root.to_path_buf();
     let mut entry = Entry::Dir;
     for segment in segments {

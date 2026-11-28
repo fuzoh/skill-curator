@@ -4,10 +4,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::Problem;
+use super::manifest::{FileRules, FrontmatterRules};
+use super::{CollectionError, LOCK_FILE, Problem};
 use crate::hash::{Digest, is_lower_hex};
 use crate::safety::{Name, RelativePath};
 
@@ -15,7 +17,7 @@ use crate::safety::{Name, RelativePath};
 pub const LOCK_FORMAT: u32 = 1;
 
 /// Parsed `lock.toml`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Lock {
     /// Lock format; only [`LOCK_FORMAT`] is understood.
@@ -35,7 +37,7 @@ impl Default for Lock {
 }
 
 /// Accepted state of one Skill.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LockedSkill {
     /// Hash of the accepted materialised directory `skills/<name>/`.
@@ -48,6 +50,32 @@ pub struct LockedSkill {
     /// Skills, one per input for Compositions, none for local Skills.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provenance: Vec<Provenance>,
+    /// The deterministic rules and written intent the accepted output was
+    /// produced with, so that `materialize` can tell which of them changed
+    /// since. Absent for local Skills, and in entries recorded without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied: Option<AppliedInputs>,
+}
+
+/// What an accepted Skill was produced from: its effective D1 and D2 rules,
+/// presets expanded, and the digest of the written intent applied to it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppliedInputs {
+    /// Digest of the written intent applied by the last agent rewrite.
+    /// Absent when no intent was applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_hash: Option<Digest>,
+    /// D1 rule sets, presets first, in application order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frontmatter: Vec<FrontmatterRules>,
+    /// D2 rule sets of a Copy or Adapt Skill, presets first, in application
+    /// order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<FileRules>,
+    /// D2 rules of each Composition input that has any.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inputs: BTreeMap<Name, FileRules>,
 }
 
 /// Origin of an upstream Skill, or of one Composition input, at its pinned
@@ -188,6 +216,20 @@ impl Lock {
         toml::to_string(self)
     }
 
+    /// Writes the lock to `lock.toml` at the Collection `root`, atomically,
+    /// replacing (never following) a symbolic link at its path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectionError::Write`] when the file cannot be written.
+    pub fn write(&self, root: &Path) -> Result<(), CollectionError> {
+        let text = self.to_toml().map_err(|err| CollectionError::Write {
+            path: root.join(LOCK_FILE),
+            source: std::io::Error::other(err),
+        })?;
+        super::write_atomically(root, LOCK_FILE, text.as_bytes())
+    }
+
     /// Consistency problems that parsing alone cannot catch: a Composition
     /// input recorded by more than one provenance entry.
     #[must_use]
@@ -250,6 +292,16 @@ url = "https://github.com/mattpocock/skills.git"
 upstream_path = "skills/grilling"
 revision = "{SHA1}"
 
+[skills.grilling.applied]
+intent_hash = "{d}"
+files = [{{ exclude = ["evals"] }}]
+
+[[skills.grilling.applied.frontmatter]]
+remove = ["allowed-tools"]
+
+[[skills.grilling.applied.frontmatter]]
+set = {{ license = "MIT", tags = ["a", 1] }}
+
 [skills.code-review]
 output_hash = "{e}"
 inputs_hash = "{f}"
@@ -269,6 +321,9 @@ url = "https://github.com/cursor/plugins.git"
 upstream_path = "pstack/critique"
 revision = "{sha256}"
 licenses = [{{ path = "LICENSE" }}, {{ path = "pstack/LICENSE", summary = "Apache-2.0" }}]
+
+[skills.code-review.applied.inputs.critique]
+exclude = ["evals"]
 
 [skills.fr-learner-voice]
 output_hash = "{a}"
@@ -305,6 +360,13 @@ output_hash = "{a}"
 
         let adapt = &lock.skills[&name("grilling")];
         assert!(adapt.provenance[0].licenses.is_empty());
+        let applied = adapt.applied.as_ref().unwrap();
+        assert_eq!(applied.intent_hash.as_ref().unwrap().as_str(), hash('d'));
+        assert_eq!(applied.files.len(), 1);
+        assert_eq!(applied.frontmatter.len(), 2);
+        assert_eq!(applied.frontmatter[0].remove, ["allowed-tools"]);
+        assert!(applied.inputs.is_empty());
+        assert!(copy.applied.is_none());
 
         let composition = &lock.skills[&name("code-review")];
         let inputs = composition
@@ -317,6 +379,11 @@ output_hash = "{a}"
         assert_eq!(critique.revision.as_str().len(), 64);
         assert_eq!(critique.licenses[0].summary, None);
         assert_eq!(critique.licenses[1].path.as_str(), "pstack/LICENSE");
+        let applied = composition.applied.as_ref().unwrap();
+        assert_eq!(
+            applied.inputs.keys().map(Name::as_str).collect::<Vec<_>>(),
+            ["critique"]
+        );
 
         let local = &lock.skills[&name("fr-learner-voice")];
         assert_eq!(local.inputs_hash, None);

@@ -138,6 +138,7 @@ fn loads_the_lock_when_present() -> TestResult {
             output_hash: digest,
             inputs_hash: None,
             provenance: Vec::new(),
+            applied: None,
         },
     );
     write(dir.path(), "lock.toml", &lock.to_toml()?)?;

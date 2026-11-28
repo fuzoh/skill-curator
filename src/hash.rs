@@ -28,6 +28,8 @@ const SHA256_HEX_LEN: usize = 64;
 const TREE_DOMAIN: &[u8] = b"skill-curator/tree/v1\0";
 /// Domain separator for Adaptation and Composition input digests.
 const INPUTS_DOMAIN: &[u8] = b"skill-curator/inputs/v1\0";
+/// Domain separator for written intent digests.
+const INTENT_DOMAIN: &[u8] = b"skill-curator/intent/v1\0";
 
 /// A SHA-256 digest written as `sha256:<64 lowercase hex digits>`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -283,6 +285,16 @@ pub fn inputs_digest(declaration: &toml::Value, intent: Option<&[u8]>) -> Digest
     Digest::from_hasher(hasher)
 }
 
+/// Hashes the bytes of a written intent, as recorded for the intent applied
+/// by an agent rewrite.
+#[must_use]
+pub fn intent_digest(intent: &[u8]) -> Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(INTENT_DOMAIN);
+    update_bytes(&mut hasher, intent);
+    Digest::from_hasher(hasher)
+}
+
 fn update_value(hasher: &mut Sha256, value: &toml::Value) {
     match value {
         toml::Value::String(text) => {
@@ -533,6 +545,15 @@ mod tests {
             changed[position] ^= 0x01;
             assert_ne!(inputs_digest(&declaration, Some(&changed)), with_intent);
         }
+    }
+
+    #[test]
+    fn intent_digest_detects_changes_and_differs_from_inputs_digests() {
+        let intent = b"Keep it short.\n";
+        assert_eq!(intent_digest(intent), intent_digest(intent));
+        assert_ne!(intent_digest(intent), intent_digest(b"Keep it short!\n"));
+        let empty = toml::Value::Table(toml::Table::new());
+        assert_ne!(intent_digest(intent), inputs_digest(&empty, Some(intent)));
     }
 
     #[test]

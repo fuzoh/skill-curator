@@ -932,6 +932,7 @@ fn extracted_provenance_feeds_the_lock_and_attribution() -> TestResult {
             output_hash: tree_digest(review.path())?,
             inputs_hash: None,
             provenance: vec![review.provenance(None)],
+            applied: None,
         },
     );
     lock.skills.insert(
@@ -943,6 +944,7 @@ fn extracted_provenance_feeds_the_lock_and_attribution() -> TestResult {
                 critique.provenance(Some(name("critique")?)),
                 review.provenance(Some(name("review")?)),
             ],
+            applied: None,
         },
     );
     let reparsed = Lock::from_toml(&lock.to_toml()?)?;
