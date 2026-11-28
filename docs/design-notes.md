@@ -277,7 +277,9 @@ reference. Choices made there:
   file's path or one of its parent directories, so `evals`, `evals/`, and
   `evals/**` all drop `evals/`; a trailing `/` matches directories only.
   `*` and `?` stay within one path component, `**` crosses any number, `\`
-  escapes, matching is case-sensitive. Invalid globs are Manifest problems.
+  escapes, matching is case-sensitive. Invalid globs, and globs with empty
+  or `.` segments (`./evals`, `evals//x`, which would match nothing), are
+  Manifest problems.
 - Rules that drop the top-level `SKILL.md` are an error naming the rule,
   never an implicit exception that keeps it.
 - D1 edits the frontmatter entry by entry instead of re-serialising it:
@@ -291,9 +293,14 @@ reference. Choices made there:
   expected entries, so an edit that would change an untouched entry (for
   example through a shared anchor) is refused. Frontmatter with several
   documents, duplicate or non-scalar top-level keys, or nesting deeper than
-  64 levels is refused too. The same helper serves `det(R)`, the
-  re-enforcement of D1 on agent output, and install-time Destination
-  rules.
+  64 levels is refused too. Aliases are compared by the node they resolve
+  to (redefined anchors included), and frontmatter that would exceed
+  100,000 nodes once its aliases are resolved is refused. Lines end at
+  `\r\n`, `\r`, or `\n`, as YAML line breaks do. Without D1 rules the
+  frontmatter is not parsed at all, so a Copy Skill, or an Adapt Skill
+  with D2 rules only, keeps a frontmatter D1 could not edit. The same
+  helper serves `det(R)`, the re-enforcement of D1 on agent output, and
+  install-time Destination rules.
 - `det(R)` applies D2, then D1, to an upstream Skill read as regular files
   only. Written Skills are new directories with `0644` or `0755` files.
 - Each `lock.toml` entry of an upstream Skill records an `applied` table:
@@ -310,15 +317,22 @@ reference. Choices made there:
   directory, or a symbolic link or special file inside it) is reported as
   manual edits, and that Skill is left alone. `--accept <skill>` records
   the current files as accepted (reminding the user to update the written
-  intent, and warning when `SKILL.md` breaks the Skill's D1 rules), then
-  replays any pending rule change on top. `--reset <skill>` rebuilds
-  `det(R)` at the pinned Revision with the current rules, discarding the
-  edits; on an agent-assisted Skill it records the intent as not applied,
-  so later runs ask for an agent rewrite. A Composition has no
-  deterministic state and cannot be reset; its Git history can restore it.
-- Input drift is classified against `applied`. A Skill still equal to
-  `det(R)` under its old rules is rebuilt under the new ones. Otherwise
-  (agent rewrites, accepted edits), D2 exclusions remove files, D1 changes
+  intent, and warning when `SKILL.md` breaks the Skill's D1 rules or has a
+  frontmatter they cannot be applied to), then replays any pending rule
+  change on top. `--reset <skill>` rebuilds `det(R)` at the pinned Revision
+  with the current rules, discarding the edits; on an agent-assisted Skill
+  it records the intent as not applied, so later runs ask for an agent
+  rewrite. A reset of a Skill whose Source or `upstream_path` changed is
+  refused as needing `update`: the pinned Revision holds the old upstream
+  Skill. A Composition has no deterministic state and cannot be reset; its
+  Git history can restore it. A local Skill takes neither option: its files
+  are recorded on every run.
+- Input drift is classified against `applied`. Files newly kept by D2 on
+  an agent-assisted Skill need an agent rewrite, even when the Skill still
+  equals `det(R)`: the agent never saw them. Apart from that, a Skill still
+  equal to `det(R)` under its old rules is rebuilt under the new ones. On
+  other Skills (agent rewrites, accepted edits), D2 exclusions remove files,
+  D1 changes
   go through a replay that changes only the keys whose upstream value the
   change affects (a key a removed rule used to drop comes back with its
   upstream value) and then enforces the new rules, and files newly kept by
