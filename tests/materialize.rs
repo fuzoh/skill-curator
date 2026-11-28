@@ -872,8 +872,9 @@ fn composition_frontmatter_changes_are_replayed_and_input_changes_need_an_agent(
         .materialize(&[])
         .code(FAILURE)
         .stdout(predicate::str::contains(
-            "paired: needs an agent rewrite: the file rules (D2) of a Composition input changed",
-        ));
+            "paired: needs an agent rewrite: the file rules (D2) of a Composition input changed; `materialize` does not run agents, and a composition Skill has no deterministic adaptation to reset to\n",
+        ))
+        .stdout(predicate::str::contains("--reset paired").not());
     fixture
         .materialize(&["--reset", "paired"])
         .code(FAILURE)
@@ -1098,6 +1099,85 @@ fn frontmatter_the_rules_cannot_edit_is_accepted_and_kept() -> TestResult {
     // A reset still rebuilds the Copy Skill from the pinned Revision.
     fixture.materialize(&["--reset", "grill-me"]).success();
     assert_eq!(fixture.read("grill-me", "SKILL.md")?, UPSTREAM_SKILL_MD);
+    Ok(())
+}
+
+#[test]
+fn manual_edits_on_a_composition_are_never_answered_with_a_reset() -> TestResult {
+    let fixture = Fixture::new()?;
+    let edited = format!("{}Manual note.\n", fixture.read("paired", "SKILL.md")?);
+    fs::write(fixture.skill("paired").join("SKILL.md"), &edited)?;
+    let lock = fixture.lock_text()?;
+    fixture.delete_upstream()?;
+
+    fixture
+        .materialize(&[])
+        .code(FAILURE)
+        .stdout(predicate::str::contains(
+            "paired: manual edits in skills/paired/ (its files differ from the accepted output recorded in lock.toml); run `skill-curator materialize --accept paired` to keep them, or restore skills/paired/ from the Collection's Git history to discard them\n",
+        ))
+        .stdout(predicate::str::contains("--reset paired").not());
+    assert_eq!(fixture.read("paired", "SKILL.md")?, edited);
+    assert_eq!(fixture.lock_text()?, lock);
+
+    // The suggested `--accept` works.
+    fixture.materialize(&["--accept", "paired"]).success();
+    assert_eq!(fixture.read("paired", "SKILL.md")?, edited);
+    fixture.assert_lock_matches("paired")?;
+
+    // A missing directory has nothing to accept; the way back is Git.
+    fs::remove_dir_all(fixture.skill("paired"))?;
+    fixture
+        .materialize(&["--accept", "paired"])
+        .code(FAILURE)
+        .stdout(predicate::str::contains(
+            "paired: failed: Skill `paired` has no manual edits to accept: `skills/paired/` is missing; restore `skills/paired/` from the Collection's Git history\n",
+        ))
+        .stdout(predicate::str::contains("--reset paired").not());
+    Ok(())
+}
+
+#[test]
+fn a_lock_entry_without_applied_rules_blocks_the_replay() -> TestResult {
+    let fixture = Fixture::new()?;
+    let mut lock = fixture.lock()?;
+    for skill in ["grilling", "paired"] {
+        lock.skills
+            .get_mut(&name(skill)?)
+            .ok_or("not locked")?
+            .applied = None;
+    }
+    lock.write(&fixture.collection())?;
+    fixture.edit_manifest(
+        GRILLING_RULES,
+        &GRILLING_RULES.replace("remove = [\"icon\"]", "remove = [\"icon\", \"version\"]"),
+    )?;
+    fixture.edit_manifest(
+        "frontmatter = { set = { name = \"paired\" } }",
+        "frontmatter = { set = { name = \"paired\" }, remove = [\"version\"] }",
+    )?;
+    let grilling = fixture.read("grilling", "SKILL.md")?;
+    let paired = fixture.read("paired", "SKILL.md")?;
+    let lock = fixture.lock_text()?;
+    fixture.delete_upstream()?;
+
+    fixture
+        .materialize(&[])
+        .code(FAILURE)
+        .stdout(predicate::str::contains(
+            "grilling: cannot replay the change: lock.toml does not record which rules produced the accepted Skill; run `skill-curator materialize --reset grilling` to rebuild it\n",
+        ))
+        .stdout(predicate::str::contains(
+            "paired: cannot replay the change: lock.toml does not record which rules produced the accepted Skill; a composition Skill has no deterministic adaptation to reset to; run `skill-curator update` to accept it again\n",
+        ));
+    assert_eq!(fixture.read("grilling", "SKILL.md")?, grilling);
+    assert_eq!(fixture.read("paired", "SKILL.md")?, paired);
+    assert_eq!(fixture.lock_text()?, lock);
+
+    // The suggested reset records the rules again.
+    fixture.materialize(&["--reset", "grilling"]).code(FAILURE);
+    assert!(!fixture.read("grilling", "SKILL.md")?.contains("version:"));
+    fixture.assert_lock_matches("grilling")?;
     Ok(())
 }
 

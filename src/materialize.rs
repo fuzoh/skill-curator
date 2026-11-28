@@ -93,6 +93,8 @@ pub enum MaterializeError {
         name: Name,
         /// Why.
         reason: String,
+        /// Whether `--reset` can rebuild the Skill (a Copy or Adapt Skill).
+        resettable: bool,
     },
     /// `lock.toml` does not record exactly one provenance entry for a Copy
     /// or Adapt Skill.
@@ -150,9 +152,21 @@ impl fmt::Display for MaterializeError {
                 f,
                 "Skill `{name}` cannot be reset: a {mode} Skill has no deterministic adaptation; restore `{SKILLS_DIR}/{name}/` from the Collection's Git history instead"
             ),
-            Self::NothingToAccept { name, reason } => write!(
+            Self::NothingToAccept {
+                name,
+                reason,
+                resettable: true,
+            } => write!(
                 f,
                 "Skill `{name}` has no manual edits to accept: {reason}; use `--reset {name}` to rebuild it"
+            ),
+            Self::NothingToAccept {
+                name,
+                reason,
+                resettable: false,
+            } => write!(
+                f,
+                "Skill `{name}` has no manual edits to accept: {reason}; restore `{SKILLS_DIR}/{name}/` from the Collection's Git history"
             ),
             Self::Provenance { name, entries } => write!(
                 f,
@@ -279,21 +293,29 @@ pub enum Outcome {
     ManualEdits {
         /// What differs.
         reason: String,
+        /// Whether `--reset` can discard them (a Copy or Adapt Skill).
+        resettable: bool,
     },
-    /// The change needs an agent rewrite, or a reset.
+    /// The change needs an agent rewrite, or a reset when the Skill has a
+    /// deterministic adaptation.
     NeedsAgent {
         /// What changed.
         reason: String,
+        /// Whether `--reset` can rebuild the Skill (an Adapt Skill).
+        resettable: bool,
     },
     /// The declared upstream Skill differs from the pinned one.
     NeedsUpdate {
         /// What differs.
         reason: String,
     },
-    /// The change cannot be replayed safely; a reset is needed.
+    /// The change cannot be replayed safely; a reset is needed, or `update`
+    /// for a Skill without a deterministic adaptation.
     Blocked {
         /// Why.
         reason: String,
+        /// Whether `--reset` can rebuild the Skill (a Copy or Adapt Skill).
+        resettable: bool,
     },
     /// The Skill could not be processed.
     Failed(MaterializeError),
@@ -377,17 +399,44 @@ impl Outcome {
             Self::NotMaterialized => format!(
                 "{name}: not materialised yet; run `skill-curator update` to fetch and accept it"
             ),
-            Self::ManualEdits { reason } => format!(
+            Self::ManualEdits {
+                reason,
+                resettable: true,
+            } => format!(
                 "{name}: manual edits in {dir} ({reason}); run `skill-curator materialize --accept {name}` to keep them or `skill-curator materialize --reset {name}` to discard them"
             ),
-            Self::NeedsAgent { reason } => format!(
+            Self::ManualEdits {
+                reason,
+                resettable: false,
+            } => format!(
+                "{name}: manual edits in {dir} ({reason}); run `skill-curator materialize --accept {name}` to keep them, or restore {dir} from the Collection's Git history to discard them"
+            ),
+            Self::NeedsAgent {
+                reason,
+                resettable: true,
+            } => format!(
                 "{name}: needs an agent rewrite: {reason}; `materialize` does not run agents; `skill-curator materialize --reset {name}` resets it to its deterministic adaptation instead"
+            ),
+            Self::NeedsAgent {
+                reason,
+                resettable: false,
+            } => format!(
+                "{name}: needs an agent rewrite: {reason}; `materialize` does not run agents, and a composition Skill has no deterministic adaptation to reset to"
             ),
             Self::NeedsUpdate { reason } => {
                 format!("{name}: {reason}; run `skill-curator update`")
             }
-            Self::Blocked { reason } => format!(
+            Self::Blocked {
+                reason,
+                resettable: true,
+            } => format!(
                 "{name}: cannot replay the change: {reason}; run `skill-curator materialize --reset {name}` to rebuild it"
+            ),
+            Self::Blocked {
+                reason,
+                resettable: false,
+            } => format!(
+                "{name}: cannot replay the change: {reason}; a composition Skill has no deterministic adaptation to reset to; run `skill-curator update` to accept it again"
             ),
             Self::Failed(err) => format!("{name}: failed: {err}"),
         }
@@ -485,7 +534,7 @@ fn check_options(collection: &Collection, options: &Options) -> Result<(), Mater
         if options.accept.contains(name) {
             return Err(MaterializeError::AcceptAndReset { name: name.clone() });
         }
-        if let Some(skill @ (Skill::Local(_) | Skill::Composition(_))) = skills.get(name) {
+        if let Some(skill) = skills.get(name).filter(|skill| !resettable(skill)) {
             return Err(MaterializeError::NoDeterministicState {
                 name: name.clone(),
                 mode: skill.mode(),
@@ -565,6 +614,7 @@ impl Run<'_> {
     }
 
     fn accept(&mut self, name: &Name, skill: &Skill) -> Result<Outcome, MaterializeError> {
+        let resettable = resettable(skill);
         let Some(locked) = self.lock.skills.get(name) else {
             return Ok(Outcome::NotMaterialized);
         };
@@ -575,12 +625,14 @@ impl Run<'_> {
                 return Err(MaterializeError::NothingToAccept {
                     name: name.clone(),
                     reason: format!("`{SKILLS_DIR}/{name}/` is missing"),
+                    resettable,
                 });
             }
             OutputState::Unhashable(reason) => {
                 return Err(MaterializeError::NothingToAccept {
                     name: name.clone(),
                     reason,
+                    resettable,
                 });
             }
         };
@@ -640,6 +692,7 @@ impl Run<'_> {
         let Some(locked) = self.lock.skills.get(name).cloned() else {
             return Ok(Outcome::NotMaterialized);
         };
+        let resettable = resettable(skill);
         let reason = match self.output_state(name, &locked.output_hash)? {
             OutputState::InSync => None,
             OutputState::Changed(_) => Some(format!(
@@ -649,7 +702,7 @@ impl Run<'_> {
             OutputState::Unhashable(reason) => Some(reason),
         };
         if let Some(reason) = reason {
-            return Ok(Outcome::ManualEdits { reason });
+            return Ok(Outcome::ManualEdits { reason, resettable });
         }
         let inputs_hash = self.collection.inputs_digest(name)?;
         if inputs_hash == locked.inputs_hash {
@@ -664,6 +717,7 @@ impl Run<'_> {
                 reason: format!(
                     "{LOCK_FILE} does not record which rules produced the accepted Skill"
                 ),
+                resettable,
             });
         };
         let agent = matches!(skill, Skill::Composition(_)) || skill.intent().is_some();
@@ -671,18 +725,22 @@ impl Run<'_> {
             return Ok(match (&old.intent_hash, agent) {
                 (None, true) => Outcome::NeedsAgent {
                     reason: "the written intent has not been applied yet".to_owned(),
+                    resettable,
                 },
                 (Some(_), true) => Outcome::NeedsAgent {
                     reason: "the written intent changed".to_owned(),
+                    resettable,
                 },
                 (_, false) => Outcome::Blocked {
                     reason: "the written intent was removed, but the accepted Skill still holds the agent rewrite it produced".to_owned(),
+                    resettable,
                 },
             });
         }
         if old.inputs != current.inputs {
             return Ok(Outcome::NeedsAgent {
                 reason: "the file rules (D2) of a Composition input changed".to_owned(),
+                resettable,
             });
         }
 
@@ -743,6 +801,7 @@ impl Run<'_> {
                     "the file rules (D2) now keep files the agent rewrite has not seen: {}",
                     list(&added)
                 ),
+                resettable: true,
             }));
         }
         // Still exactly the deterministic adaptation: rebuild it, so the
@@ -759,6 +818,7 @@ impl Run<'_> {
                     reason: format!(
                         "the file rules (D2) now keep `{path}`, but the accepted Skill already has a file there"
                     ),
+                    resettable: true,
                 }));
             }
             if let Some(file) = upstream.get(&path) {
@@ -875,6 +935,12 @@ fn replay_composition(
         }
     }
     Ok(changes)
+}
+
+/// Whether `--reset` can rebuild `skill`: only Copy and Adapt Skills have a
+/// deterministic adaptation.
+fn resettable(skill: &Skill) -> bool {
+    matches!(skill, Skill::Copy(_) | Skill::Adapt(_))
 }
 
 fn rules_of(applied: &AppliedInputs) -> Rules<'_> {
@@ -1002,10 +1068,19 @@ mod tests {
         let reason = || "why".to_owned();
         for outcome in [
             Outcome::NotMaterialized,
-            Outcome::ManualEdits { reason: reason() },
-            Outcome::NeedsAgent { reason: reason() },
+            Outcome::ManualEdits {
+                reason: reason(),
+                resettable: true,
+            },
+            Outcome::NeedsAgent {
+                reason: reason(),
+                resettable: false,
+            },
             Outcome::NeedsUpdate { reason: reason() },
-            Outcome::Blocked { reason: reason() },
+            Outcome::Blocked {
+                reason: reason(),
+                resettable: true,
+            },
             Outcome::Failed(MaterializeError::UnknownSkill { name: name("a") }),
         ] {
             assert!(outcome.is_pending(), "{outcome:?}");
@@ -1028,10 +1103,64 @@ mod tests {
             skills: vec![
                 (name("a"), Outcome::Unchanged),
                 (name("b"), Outcome::NotMaterialized),
-                (name("c"), Outcome::Blocked { reason: reason() }),
+                (
+                    name("c"),
+                    Outcome::Blocked {
+                        reason: reason(),
+                        resettable: false,
+                    },
+                ),
             ],
         };
         assert_eq!(report.pending(), 2);
+    }
+
+    #[test]
+    fn only_skills_with_a_deterministic_adaptation_are_told_to_reset() {
+        let s = name("s");
+        let hints = |resettable: bool| {
+            let reason = || "why".to_owned();
+            [
+                Outcome::ManualEdits {
+                    reason: reason(),
+                    resettable,
+                },
+                Outcome::NeedsAgent {
+                    reason: reason(),
+                    resettable,
+                },
+                Outcome::Blocked {
+                    reason: reason(),
+                    resettable,
+                },
+            ]
+            .map(|outcome| outcome.describe(&s))
+        };
+        for hint in hints(true) {
+            assert!(
+                hint.contains("`skill-curator materialize --reset s`"),
+                "{hint}"
+            );
+        }
+        assert_eq!(
+            hints(false),
+            [
+                "s: manual edits in skills/s/ (why); run `skill-curator materialize --accept s` to keep them, or restore skills/s/ from the Collection's Git history to discard them",
+                "s: needs an agent rewrite: why; `materialize` does not run agents, and a composition Skill has no deterministic adaptation to reset to",
+                "s: cannot replay the change: why; a composition Skill has no deterministic adaptation to reset to; run `skill-curator update` to accept it again",
+            ]
+        );
+        let nothing = |resettable| {
+            MaterializeError::NothingToAccept {
+                name: s.clone(),
+                reason: "why".to_owned(),
+                resettable,
+            }
+            .to_string()
+        };
+        assert!(nothing(true).ends_with("use `--reset s` to rebuild it"));
+        assert!(nothing(false).ends_with("restore `skills/s/` from the Collection's Git history"));
+        assert!(resettable(&copy("upstream", "skills/a")));
     }
 
     #[test]

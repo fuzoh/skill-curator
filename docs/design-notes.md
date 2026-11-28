@@ -327,7 +327,9 @@ reference. Choices made there:
   rewrite. A reset of a Skill whose Source or `upstream_path` changed is
   refused as needing `update`: the pinned Revision holds the old upstream
   Skill. A Composition has no deterministic state and cannot be reset; its
-  Git history can restore it. A local Skill takes neither option: its files
+  Git history can restore it, so the hints printed for a Composition never
+  suggest `--reset` (manual edits: `--accept` or the Git history; a missing
+  `applied` table: `update`). A local Skill takes neither option: its files
   are recorded on every run.
 - Input drift is classified against `applied`. Files newly kept by D2 on
   an agent-assisted Skill need an agent rewrite, even when the Skill still
