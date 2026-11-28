@@ -30,7 +30,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::adaptation::files::{FileFilter, FilesError};
 use crate::adaptation::frontmatter::{FrontmatterError, apply_rules, replay_rules};
@@ -116,16 +116,6 @@ pub enum MaterializeError {
         /// Underlying error.
         source: io::Error,
     },
-    /// A Skill directory could not be replaced, nor its previous files put
-    /// back; they are kept at `kept`.
-    Restore {
-        /// Path of the Skill directory.
-        path: PathBuf,
-        /// Where the previous files of the Skill are kept.
-        kept: PathBuf,
-        /// Underlying error.
-        source: io::Error,
-    },
     /// The Collection could not be read or written.
     Collection(CollectionError),
     /// The pinned Revision could not be read from the Source cache.
@@ -178,12 +168,6 @@ impl fmt::Display for MaterializeError {
                 path.display()
             ),
             Self::Write { path, source } => write!(f, "cannot write {}: {source}", path.display()),
-            Self::Restore { path, kept, source } => write!(
-                f,
-                "cannot write {}: {source}; its previous files could not be put back and are kept in {}",
-                path.display(),
-                kept.display()
-            ),
             Self::Collection(err) => err.fmt(f),
             Self::Source(err) => err.fmt(f),
             Self::Adaptation(err) => err.fmt(f),
@@ -194,7 +178,7 @@ impl fmt::Display for MaterializeError {
 impl std::error::Error for MaterializeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Write { source, .. } | Self::Restore { source, .. } => Some(source),
+            Self::Write { source, .. } => Some(source),
             Self::Collection(err) => Some(err),
             Self::Source(err) => Some(err),
             Self::Adaptation(err) => Some(err),
@@ -862,47 +846,19 @@ impl Run<'_> {
     fn replace_skill(&self, name: &Name, tree: &SkillTree) -> Result<(), MaterializeError> {
         let root = self.collection.root();
         let skills = root.join(SKILLS_DIR);
-        let write_error = |path: &Path| {
-            let path = path.to_path_buf();
-            move |source| MaterializeError::Write { path, source }
-        };
         match inspect(root, &[SKILLS_DIR])? {
             Entry::Dir => {}
-            Entry::Missing => fs::create_dir(&skills).map_err(write_error(&skills))?,
+            Entry::Missing => {
+                fs::create_dir(&skills).map_err(|source| MaterializeError::Write {
+                    path: skills.clone(),
+                    source,
+                })?;
+            }
             Entry::Symlink(_) | Entry::File | Entry::Other => {
                 return Err(MaterializeError::SkillsDir { path: skills });
             }
         }
-        let staging = tempfile::Builder::new()
-            .prefix(STAGING_PREFIX)
-            .tempdir_in(&skills)
-            .map_err(write_error(&skills))?;
-        let new = staging.path().join("new");
-        tree.write_new(&new)?;
-        let target = self.collection.skill_dir(name);
-        let old = staging.path().join("old");
-        let had_old = match fs::symlink_metadata(&target) {
-            Ok(_) => {
-                fs::rename(&target, &old).map_err(write_error(&target))?;
-                true
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => false,
-            Err(err) => return Err(write_error(&target)(err)),
-        };
-        if let Err(err) = fs::rename(&new, &target) {
-            // Put the previous Skill back; the swap failed as a whole. If
-            // even that fails, keep the staging directory holding it rather
-            // than deleting the only copy.
-            if had_old && fs::rename(&old, &target).is_err() {
-                return Err(MaterializeError::Restore {
-                    path: target,
-                    kept: staging.keep().join("old"),
-                    source: err,
-                });
-            }
-            return Err(write_error(&target)(err));
-        }
-        drop(staging);
+        tree.replace(&self.collection.skill_dir(name), STAGING_PREFIX)?;
         Ok(())
     }
 }

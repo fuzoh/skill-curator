@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use crate::collection::SKILL_FILE;
 use crate::collection::manifest::{CompositionInput, FileRules, FrontmatterRules, Manifest, Skill};
+use crate::hash::{self, Digest};
 use crate::safety::{PathError, RelativePath};
 use files::{FileFilter, FilesError};
 use frontmatter::FrontmatterError;
@@ -76,6 +77,16 @@ pub enum AdaptationError {
         /// Why it is refused.
         reason: PathError,
     },
+    /// A directory could not be replaced, nor its previous files put back;
+    /// they are kept at `kept`.
+    Restore {
+        /// Path of the directory being replaced.
+        path: PathBuf,
+        /// Where its previous files are kept.
+        kept: PathBuf,
+        /// Underlying error.
+        source: io::Error,
+    },
     /// `SKILL.md` is not valid UTF-8.
     SkillFileNotUtf8,
     /// D2 file rules cannot be applied.
@@ -106,6 +117,12 @@ impl fmt::Display for AdaptationError {
             Self::UnsafePath { path, reason } => {
                 write!(f, "the Skill file `{path}` cannot be kept: {reason}")
             }
+            Self::Restore { path, kept, source } => write!(
+                f,
+                "cannot write {}: {source}; its previous files could not be put back and are kept in {}",
+                path.display(),
+                kept.display()
+            ),
             Self::SkillFileNotUtf8 => write!(f, "`{SKILL_FILE}` is not valid UTF-8"),
             Self::Files(err) => err.fmt(f),
             Self::Frontmatter(err) => write!(f, "`{SKILL_FILE}`: {err}"),
@@ -116,7 +133,9 @@ impl fmt::Display for AdaptationError {
 impl std::error::Error for AdaptationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
+            Self::Read { source, .. }
+            | Self::Write { source, .. }
+            | Self::Restore { source, .. } => Some(source),
             Self::Files(err) => Some(err),
             Self::Frontmatter(err) => Some(err),
             _ => None,
@@ -327,6 +346,70 @@ impl SkillTree {
     }
 }
 
+impl SkillTree {
+    /// Digest of the files, equal to [`hash::tree_digest`] of the tree once
+    /// written to a directory.
+    #[must_use]
+    pub fn digest(&self) -> Digest {
+        hash::files_digest(
+            self.files
+                .iter()
+                .map(|(path, file)| (path.as_str(), file.contents.as_slice())),
+        )
+    }
+
+    /// Replaces the directory `target` with this tree, or creates it: writes
+    /// the tree into a staging directory next to `target`, named with
+    /// `staging_prefix`, then swaps it into place, so a failure never leaves
+    /// a half-written directory. Whatever `target` held before, including a
+    /// symbolic link or a file, is moved aside and deleted, never followed.
+    /// `target`'s parent must exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdaptationError::Write`] when the tree cannot be written or
+    /// swapped in, and [`AdaptationError::Restore`] when, after a failed
+    /// swap, the previous content cannot be put back either; it is then kept
+    /// in the staging directory.
+    pub fn replace(&self, target: &Path, staging_prefix: &str) -> Result<(), AdaptationError> {
+        let write_error = |path: &Path| {
+            let path = path.to_path_buf();
+            move |source| AdaptationError::Write { path, source }
+        };
+        let parent = target.parent().unwrap_or(target);
+        let staging = tempfile::Builder::new()
+            .prefix(staging_prefix)
+            .tempdir_in(parent)
+            .map_err(write_error(parent))?;
+        let new = staging.path().join("new");
+        self.write_new(&new)?;
+        let old = staging.path().join("old");
+        let had_old = match fs::symlink_metadata(target) {
+            Ok(_) => {
+                fs::rename(target, &old).map_err(write_error(target))?;
+                true
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+            Err(err) => return Err(write_error(target)(err)),
+        };
+        if let Err(err) = fs::rename(&new, target) {
+            // Put the previous content back; the swap failed as a whole. If
+            // even that fails, keep the staging directory holding it rather
+            // than deleting the only copy.
+            if had_old && fs::rename(&old, target).is_err() {
+                return Err(AdaptationError::Restore {
+                    path: target.to_path_buf(),
+                    kept: staging.keep().join("old"),
+                    source: err,
+                });
+            }
+            return Err(write_error(target)(err));
+        }
+        drop(staging);
+        Ok(())
+    }
+}
+
 /// The deterministic rules of a Skill or Composition input, presets first,
 /// in application order. Empty rule sets are left out.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -463,6 +546,53 @@ mod tests {
             tree.write_new(&into),
             Err(AdaptationError::Write { .. })
         ));
+    }
+
+    #[test]
+    fn digest_matches_the_written_directory() {
+        let dir = upstream();
+        let tree = SkillTree::read(dir.path()).unwrap();
+        assert_eq!(tree.digest(), hash::tree_digest(dir.path()).unwrap());
+        let mut changed = tree.clone();
+        changed.set_skill_md("---\nname: other\n---\n".to_owned());
+        assert_ne!(changed.digest(), tree.digest());
+    }
+
+    #[test]
+    fn replace_swaps_in_the_tree_without_following_what_was_there() {
+        let dir = upstream();
+        let tree = SkillTree::read(dir.path()).unwrap();
+        let out = TempDir::new().unwrap();
+
+        // Created when missing.
+        let target = out.path().join("skill");
+        tree.replace(&target, ".staging-").unwrap();
+        assert_eq!(SkillTree::read(&target).unwrap(), tree);
+
+        // An existing directory is replaced as a whole.
+        write(&target, "stale.md", "stale");
+        tree.replace(&target, ".staging-").unwrap();
+        assert_eq!(SkillTree::read(&target).unwrap(), tree);
+
+        // A symbolic link is replaced, and what it pointed to is untouched.
+        let elsewhere = TempDir::new().unwrap();
+        write(elsewhere.path(), "keep.md", "keep");
+        fs::remove_dir_all(&target).unwrap();
+        symlink(elsewhere.path(), &target).unwrap();
+        tree.replace(&target, ".staging-").unwrap();
+        assert!(fs::symlink_metadata(&target).unwrap().is_dir());
+        assert_eq!(
+            fs::read_to_string(elsewhere.path().join("keep.md")).unwrap(),
+            "keep"
+        );
+        assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 1);
+
+        // No staging directory is left behind.
+        let names = fs::read_dir(out.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["skill"]);
     }
 
     #[test]

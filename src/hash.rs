@@ -6,6 +6,8 @@
 //! - [`inputs_digest`] hashes the normalised inputs of an Adaptation or
 //!   Composition: a structured value (the declaration and its D1/D2 rules)
 //!   plus the bytes of the written intent, if any.
+//! - [`file_digest`] hashes one installed file, such as a global instruction
+//!   file, recorded in the install state.
 //!
 //! Both encodings are length-prefixed and domain-separated, so no two
 //! different inputs share an encoding, and neither depends on how the TOML
@@ -30,6 +32,8 @@ const TREE_DOMAIN: &[u8] = b"skill-curator/tree/v1\0";
 const INPUTS_DOMAIN: &[u8] = b"skill-curator/inputs/v1\0";
 /// Domain separator for written intent digests.
 const INTENT_DOMAIN: &[u8] = b"skill-curator/intent/v1\0";
+/// Domain separator for installed file digests.
+const FILE_DOMAIN: &[u8] = b"skill-curator/file/v1\0";
 
 /// A SHA-256 digest written as `sha256:<64 lowercase hex digits>`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -222,15 +226,48 @@ pub fn tree_digest(root: &Path) -> Result<Digest, HashError> {
     collect_files(root, "", &mut files)?;
     files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-    let mut hasher = Sha256::new();
-    hasher.update(TREE_DOMAIN);
-    update_len(&mut hasher, files.len());
+    let mut hasher = TreeHasher::new(files.len());
     for (relative, path) in &files {
         let contents = fs::read(path).map_err(io_error(path))?;
-        update_bytes(&mut hasher, relative.as_bytes());
-        update_bytes(&mut hasher, &contents);
+        hasher.file(relative, &contents);
     }
-    Ok(Digest::from_hasher(hasher))
+    Ok(hasher.finish())
+}
+
+/// Hashes files held in memory exactly as [`tree_digest`] hashes the same
+/// files written below a directory, so an in-memory Skill can be compared
+/// with a directory on disk without writing it.
+///
+/// `files` yields each file's path relative to the tree root (with `/`
+/// separators) and its contents, sorted by path.
+#[must_use]
+pub fn files_digest<'a>(files: impl ExactSizeIterator<Item = (&'a str, &'a [u8])>) -> Digest {
+    let mut hasher = TreeHasher::new(files.len());
+    for (relative, contents) in files {
+        hasher.file(relative, contents);
+    }
+    hasher.finish()
+}
+
+/// The encoding shared by [`tree_digest`] and [`files_digest`].
+struct TreeHasher(Sha256);
+
+impl TreeHasher {
+    fn new(file_count: usize) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(TREE_DOMAIN);
+        update_len(&mut hasher, file_count);
+        Self(hasher)
+    }
+
+    fn file(&mut self, relative: &str, contents: &[u8]) {
+        update_bytes(&mut self.0, relative.as_bytes());
+        update_bytes(&mut self.0, contents);
+    }
+
+    fn finish(self) -> Digest {
+        Digest::from_hasher(self.0)
+    }
 }
 
 /// Collects `(relative path, absolute path)` pairs for every regular file
@@ -292,6 +329,16 @@ pub fn intent_digest(intent: &[u8]) -> Digest {
     let mut hasher = Sha256::new();
     hasher.update(INTENT_DOMAIN);
     update_bytes(&mut hasher, intent);
+    Digest::from_hasher(hasher)
+}
+
+/// Hashes the contents of a single installed file, such as a global
+/// instruction file assembled from Fragments.
+#[must_use]
+pub fn file_digest(contents: &[u8]) -> Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(FILE_DOMAIN);
+    update_bytes(&mut hasher, contents);
     Digest::from_hasher(hasher)
 }
 
@@ -584,4 +631,30 @@ mod tests {
 
     const PINNED_TREE_DIGEST: &str =
         "sha256:f186d7b50a90663e39965487a45e4bebbe450b341d28570c5beeea7cb71c6e13";
+
+    #[test]
+    fn files_digest_matches_the_tree_digest_of_the_same_files() {
+        let mut sorted = SKILL.to_vec();
+        sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        assert_eq!(
+            files_digest(sorted.iter().copied()).as_str(),
+            PINNED_TREE_DIGEST
+        );
+        assert_ne!(
+            files_digest(sorted[1..].iter().copied()),
+            files_digest(sorted.iter().copied())
+        );
+    }
+
+    #[test]
+    fn file_digest_detects_changes_and_differs_from_other_digests() {
+        let text = b"<!-- Managed by skill-curator -->\n";
+        assert_eq!(file_digest(text), file_digest(text));
+        assert_ne!(
+            file_digest(text),
+            file_digest(b"<!-- Managed by skill-curator -->\r\n")
+        );
+        assert_ne!(file_digest(text), intent_digest(text));
+        assert_ne!(file_digest(b""), files_digest(std::iter::empty()));
+    }
 }
