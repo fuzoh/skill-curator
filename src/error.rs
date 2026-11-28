@@ -2,6 +2,7 @@ use std::fmt;
 use std::process::ExitCode;
 
 use crate::collection::CollectionError;
+use crate::install::InstallError;
 use crate::materialize::MaterializeError;
 
 /// Failure of a `skill-curator` command after its arguments were accepted.
@@ -23,10 +24,18 @@ pub enum Error {
     Collection(CollectionError),
     /// `materialize` could not run.
     Materialize(MaterializeError),
+    /// `install` could not run.
+    Install(InstallError),
     /// The command finished, but Skills still need the user's attention; each
     /// was reported on standard output.
     Unresolved {
         /// Number of Skill outcomes still needing attention.
+        count: usize,
+    },
+    /// `install` finished, but paths in Destinations still need the user's
+    /// attention; each was reported on standard output and left untouched.
+    InstallUnresolved {
+        /// Number of paths still needing attention.
         count: usize,
     },
 }
@@ -42,7 +51,9 @@ impl Error {
             | Self::Environment { .. }
             | Self::Collection(_)
             | Self::Materialize(_)
-            | Self::Unresolved { .. } => ExitCode::FAILURE,
+            | Self::Install(_)
+            | Self::Unresolved { .. }
+            | Self::InstallUnresolved { .. } => ExitCode::FAILURE,
         }
     }
 }
@@ -56,8 +67,16 @@ impl fmt::Display for Error {
             Self::Environment { message } => f.write_str(message),
             Self::Collection(err) => err.fmt(f),
             Self::Materialize(err) => err.fmt(f),
+            Self::Install(err) => err.fmt(f),
             Self::Unresolved { count: 1 } => f.write_str("1 Skill outcome needs attention"),
             Self::Unresolved { count } => write!(f, "{count} Skill outcomes need attention"),
+            Self::InstallUnresolved { count: 1 } => {
+                f.write_str("1 path in a Destination needs attention; it was left untouched")
+            }
+            Self::InstallUnresolved { count } => write!(
+                f,
+                "{count} paths in Destinations need attention; they were left untouched"
+            ),
         }
     }
 }
@@ -67,6 +86,7 @@ impl std::error::Error for Error {
         match self {
             Self::Collection(err) => Some(err),
             Self::Materialize(err) => Some(err),
+            Self::Install(err) => Some(err),
             _ => None,
         }
     }
@@ -75,6 +95,12 @@ impl std::error::Error for Error {
 impl From<CollectionError> for Error {
     fn from(err: CollectionError) -> Self {
         Self::Collection(err)
+    }
+}
+
+impl From<InstallError> for Error {
+    fn from(err: InstallError) -> Self {
+        Self::Install(err)
     }
 }
 
@@ -90,10 +116,10 @@ mod tests {
 
     #[test]
     fn not_implemented_names_the_command() {
-        let err = Error::NotImplemented { command: "install" };
+        let err = Error::NotImplemented { command: "status" };
         assert_eq!(
             err.to_string(),
-            "the `install` command is not implemented yet"
+            "the `status` command is not implemented yet"
         );
         assert_eq!(err.exit_code(), ExitCode::FAILURE);
     }
@@ -106,6 +132,20 @@ mod tests {
         );
         let err = Error::Unresolved { count: 3 };
         assert_eq!(err.to_string(), "3 Skill outcomes need attention");
+        assert_eq!(err.exit_code(), ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn install_unresolved_counts_the_targets_and_fails() {
+        assert_eq!(
+            Error::InstallUnresolved { count: 1 }.to_string(),
+            "1 path in a Destination needs attention; it was left untouched"
+        );
+        let err = Error::InstallUnresolved { count: 2 };
+        assert_eq!(
+            err.to_string(),
+            "2 paths in Destinations need attention; they were left untouched"
+        );
         assert_eq!(err.exit_code(), ExitCode::FAILURE);
     }
 }

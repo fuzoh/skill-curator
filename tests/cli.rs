@@ -14,7 +14,7 @@ type TestResult = Result<(), Box<dyn Error>>;
 const SUBCOMMANDS: [&str; 5] = ["status", "check", "update", "materialize", "install"];
 
 /// Subcommands that have no behaviour yet.
-const NOT_IMPLEMENTED: [&str; 4] = ["status", "check", "update", "install"];
+const NOT_IMPLEMENTED: [&str; 3] = ["status", "check", "update"];
 
 /// Exit code for usage errors reported by the argument parser.
 const USAGE_ERROR: i32 = 2;
@@ -229,6 +229,22 @@ fn materialize_outside_a_collection_fails_without_writing() -> TestResult {
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::starts_with("skill-curator: error: "))
         .stderr(predicate::str::contains("manifest.toml"));
+    assert_eq!(std::fs::read_dir(sandbox.path())?.count(), 0);
+    Ok(())
+}
+
+#[test]
+fn install_outside_a_collection_fails_without_writing() -> TestResult {
+    let sandbox = TempDir::new()?;
+    for args in [vec!["install"], vec!["install", "--dry-run"]] {
+        skill_curator(sandbox.path())
+            .args(&args)
+            .assert()
+            .code(FAILURE)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::starts_with("skill-curator: error: "))
+            .stderr(predicate::str::contains("manifest.toml"));
+    }
     assert_eq!(std::fs::read_dir(sandbox.path())?.count(), 0);
     Ok(())
 }

@@ -358,12 +358,12 @@ impl SkillTree {
         )
     }
 
-    /// Replaces the directory `target` with this tree, or creates it: writes
-    /// the tree into a staging directory next to `target`, named with
+    /// Replaces the directory `dir` with this tree, or creates it: writes
+    /// the tree into a staging directory next to `dir`, named with
     /// `staging_prefix`, then swaps it into place, so a failure never leaves
-    /// a half-written directory. Whatever `target` held before, including a
+    /// a half-written directory. Whatever `dir` held before, including a
     /// symbolic link or a file, is moved aside and deleted, never followed.
-    /// `target`'s parent must exist.
+    /// `dir`'s parent must exist.
     ///
     /// # Errors
     ///
@@ -371,12 +371,12 @@ impl SkillTree {
     /// swapped in, and [`AdaptationError::Restore`] when, after a failed
     /// swap, the previous content cannot be put back either; it is then kept
     /// in the staging directory.
-    pub fn replace(&self, target: &Path, staging_prefix: &str) -> Result<(), AdaptationError> {
+    pub fn replace(&self, dir: &Path, staging_prefix: &str) -> Result<(), AdaptationError> {
         let write_error = |path: &Path| {
             let path = path.to_path_buf();
             move |source| AdaptationError::Write { path, source }
         };
-        let parent = target.parent().unwrap_or(target);
+        let parent = dir.parent().unwrap_or(dir);
         let staging = tempfile::Builder::new()
             .prefix(staging_prefix)
             .tempdir_in(parent)
@@ -384,26 +384,26 @@ impl SkillTree {
         let new = staging.path().join("new");
         self.write_new(&new)?;
         let old = staging.path().join("old");
-        let had_old = match fs::symlink_metadata(target) {
+        let had_old = match fs::symlink_metadata(dir) {
             Ok(_) => {
-                fs::rename(target, &old).map_err(write_error(target))?;
+                fs::rename(dir, &old).map_err(write_error(dir))?;
                 true
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => false,
-            Err(err) => return Err(write_error(target)(err)),
+            Err(err) => return Err(write_error(dir)(err)),
         };
-        if let Err(err) = fs::rename(&new, target) {
+        if let Err(err) = fs::rename(&new, dir) {
             // Put the previous content back; the swap failed as a whole. If
             // even that fails, keep the staging directory holding it rather
             // than deleting the only copy.
-            if had_old && fs::rename(&old, target).is_err() {
+            if had_old && fs::rename(&old, dir).is_err() {
                 return Err(AdaptationError::Restore {
-                    path: target.to_path_buf(),
+                    path: dir.to_path_buf(),
                     kept: staging.keep().join("old"),
                     source: err,
                 });
             }
-            return Err(write_error(target)(err));
+            return Err(write_error(dir)(err));
         }
         drop(staging);
         Ok(())
@@ -565,22 +565,22 @@ mod tests {
         let out = TempDir::new().unwrap();
 
         // Created when missing.
-        let target = out.path().join("skill");
-        tree.replace(&target, ".staging-").unwrap();
-        assert_eq!(SkillTree::read(&target).unwrap(), tree);
+        let dir = out.path().join("skill");
+        tree.replace(&dir, ".staging-").unwrap();
+        assert_eq!(SkillTree::read(&dir).unwrap(), tree);
 
         // An existing directory is replaced as a whole.
-        write(&target, "stale.md", "stale");
-        tree.replace(&target, ".staging-").unwrap();
-        assert_eq!(SkillTree::read(&target).unwrap(), tree);
+        write(&dir, "stale.md", "stale");
+        tree.replace(&dir, ".staging-").unwrap();
+        assert_eq!(SkillTree::read(&dir).unwrap(), tree);
 
         // A symbolic link is replaced, and what it pointed to is untouched.
         let elsewhere = TempDir::new().unwrap();
         write(elsewhere.path(), "keep.md", "keep");
-        fs::remove_dir_all(&target).unwrap();
-        symlink(elsewhere.path(), &target).unwrap();
-        tree.replace(&target, ".staging-").unwrap();
-        assert!(fs::symlink_metadata(&target).unwrap().is_dir());
+        fs::remove_dir_all(&dir).unwrap();
+        symlink(elsewhere.path(), &dir).unwrap();
+        tree.replace(&dir, ".staging-").unwrap();
+        assert!(fs::symlink_metadata(&dir).unwrap().is_dir());
         assert_eq!(
             fs::read_to_string(elsewhere.path().join("keep.md")).unwrap(),
             "keep"

@@ -10,6 +10,8 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::Error;
 use crate::collection::Collection;
+use crate::collection::machine::default_machine_config_path;
+use crate::install::{self, state::default_state_path};
 use crate::materialize::{self, Options};
 use crate::safety::{HomeDir, Name, PathError};
 use crate::source::{Git, SourceCache};
@@ -48,7 +50,21 @@ pub enum Command {
     Materialize(MaterializeArgs),
     /// Copy accepted Skills and assembled Fragments to the enabled
     /// Destinations.
-    Install,
+    Install(InstallArgs),
+}
+
+/// Options of `install`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Args)]
+pub struct InstallArgs {
+    /// Preview additions, updates, removals, and manual edits without
+    /// writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Overwrite or delete Skills and instruction files that skill-curator
+    /// installed and that were edited in a Destination since. Files
+    /// skill-curator did not install are never touched.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Choices for Skills whose files in `skills/<name>/` were edited by hand.
@@ -76,7 +92,7 @@ impl Command {
             Self::Check => "check",
             Self::Update => "update",
             Self::Materialize(_) => "materialize",
-            Self::Install => "install",
+            Self::Install(_) => "install",
         }
     }
 }
@@ -91,6 +107,7 @@ impl Command {
 pub fn run(cli: &Cli) -> Result<(), Error> {
     match &cli.command {
         Command::Materialize(args) => run_materialize(cli, args),
+        Command::Install(args) => run_install(cli, *args),
         command => Err(Error::NotImplemented {
             command: command.name(),
         }),
@@ -115,6 +132,50 @@ fn run_materialize(cli: &Cli, args: &MaterializeArgs) -> Result<(), Error> {
     }
 }
 
+fn run_install(cli: &Cli, args: InstallArgs) -> Result<(), Error> {
+    let root = collection_root(cli)?;
+    let home = home_dir("locates the Destinations")?;
+    let machine_config = match &cli.machine_config {
+        Some(path) => path.clone(),
+        None => default_machine_config_path(
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+            Some(home.as_path().as_os_str()),
+        )
+        .ok_or_else(|| Error::Environment {
+            message: "cannot locate machine.toml; pass `--machine-config`".to_owned(),
+        })?,
+    };
+    let state = default_state_path(
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        Some(home.as_path().as_os_str()),
+    )
+    .ok_or_else(|| Error::Environment {
+        message:
+            "cannot locate the install state; set `XDG_STATE_HOME` or `HOME` to an absolute path"
+                .to_owned(),
+    })?;
+    let collection = Collection::load(&root)?;
+    let destinations = collection.destinations(&machine_config, &home)?;
+    let options = install::Options {
+        dry_run: args.dry_run,
+        force: args.force,
+    };
+    let report = install::install(&collection, &destinations, &state, options)?;
+    for warning in &report.warnings {
+        eprintln!("skill-curator: warning: {warning}");
+    }
+    for item in &report.items {
+        if item.outcome != install::Outcome::Unchanged {
+            println!("{}", item.describe(report.dry_run));
+        }
+    }
+    println!("{}", report.summary());
+    match report.pending() {
+        0 => Ok(()),
+        count => Err(Error::InstallUnresolved { count }),
+    }
+}
+
 /// The Collection directory: `--collection`, or the working directory.
 fn collection_root(cli: &Cli) -> Result<PathBuf, Error> {
     match &cli.collection {
@@ -125,17 +186,22 @@ fn collection_root(cli: &Cli) -> Result<PathBuf, Error> {
     }
 }
 
-/// The Source cache under `$XDG_CACHE_HOME`, or `~/.cache`.
-fn source_cache() -> Result<SourceCache, Error> {
-    let home = std::env::var_os("HOME")
+/// The home directory from `HOME`, which `purpose` describes.
+fn home_dir(purpose: &str) -> Result<HomeDir, Error> {
+    std::env::var_os("HOME")
         .ok_or_else(|| Error::Environment {
-            message: "`HOME` is not set; it locates the Source cache".to_owned(),
+            message: format!("`HOME` is not set; it {purpose}"),
         })
         .and_then(|home| {
             HomeDir::new(home).map_err(|err| Error::Environment {
-                message: format!("`HOME` cannot locate the Source cache: {err}"),
+                message: format!("`HOME` is not usable: {err}; it {purpose}"),
             })
-        })?;
+        })
+}
+
+/// The Source cache under `$XDG_CACHE_HOME`, or `~/.cache`.
+fn source_cache() -> Result<SourceCache, Error> {
+    let home = home_dir("locates the Source cache")?;
     let root = SourceCache::default_root(std::env::var_os("XDG_CACHE_HOME").as_deref(), &home);
     Ok(SourceCache::new(root, Git::system()))
 }
@@ -176,7 +242,7 @@ mod tests {
             "/tmp/machine.toml",
         ])
         .unwrap();
-        assert_eq!(cli.command, Command::Install);
+        assert_eq!(cli.command, Command::Install(InstallArgs::default()));
         assert_eq!(cli.collection, Some(PathBuf::from("/tmp/collection")));
         assert_eq!(cli.machine_config, Some(PathBuf::from("/tmp/machine.toml")));
     }
@@ -192,7 +258,7 @@ mod tests {
             Command::Check,
             Command::Update,
             Command::Materialize(MaterializeArgs::default()),
-            Command::Install,
+            Command::Install(InstallArgs::default()),
         ]
         .map(|command| command.name().to_owned());
         assert_eq!(parsed, named);
@@ -205,6 +271,19 @@ mod tests {
             run(&cli),
             Err(Error::NotImplemented { command: "status" })
         ));
+    }
+
+    #[test]
+    fn install_takes_dry_run_and_force() {
+        let cli =
+            Cli::try_parse_from(["skill-curator", "install", "--dry-run", "--force"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Install(InstallArgs {
+                dry_run: true,
+                force: true,
+            })
+        );
     }
 
     #[test]
