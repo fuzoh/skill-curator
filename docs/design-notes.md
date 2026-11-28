@@ -394,6 +394,18 @@ Choices made there:
   `BRIEF.md`. A non-zero exit discards the output. Manual mode starts
   nothing: it prints the staging directory and waits for Enter; `abort` or
   end of input stops the rewrite.
+- No agent may load a view file as instructions. `pi` reads context files
+  only from its working directory and the directories above it, and the
+  staging directory holds none. Claude Code also loads `CLAUDE.md`,
+  `CLAUDE.local.md`, and rules files, and Skills in `.claude/skills/`, from
+  directories below its working directory once it touches a file there, so
+  an upstream Skill shipping one would reach it as instructions. `claude`
+  is therefore started with `--settings '{"claudeMdExcludes":["**/<staging
+  directory name>/**"]}'` and `--disable-slash-commands`, which also
+  disables the user's own skills for that session. The pattern names the
+  staging directory by its last component (the fixed prefix plus random
+  letters and digits), so no glob or JSON syntax from the temporary
+  directory path can reach it.
 - `output/` is accepted only as a real directory of regular files and
   directories: symbolic links anywhere (including `output/` itself), hard
   links (a file with more than one link may live outside `output/`),

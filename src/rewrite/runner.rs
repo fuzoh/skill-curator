@@ -4,10 +4,21 @@
 //! [`AGENT_PROMPT`] as their first message, inheriting the terminal, and the
 //! rewrite continues once they exit. [`Agent::Manual`] starts nothing: it
 //! prints the staging directory and waits for the user to confirm.
+//!
+//! Every file in the reference views is data, so no agent may load one as
+//! instructions. `pi` loads context files only from its working directory
+//! and the directories above it, and the staging directory holds none.
+//! Claude Code also loads `CLAUDE.md` files and `.claude/skills/` Skills
+//! from the directories below its working directory as soon as it touches a
+//! file there, which would turn an upstream `CLAUDE.md` or a Skill nested in
+//! a view into instructions. `claude` is therefore started with every memory
+//! file of the staging directory excluded (`claudeMdExcludes`) and with
+//! skills and commands disabled (`--disable-slash-commands`).
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{BufRead, Write};
+use std::path::Path;
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +32,10 @@ pub const AGENT_PROMPT: &str = "Read BRIEF.md in the current directory and follo
 
 /// Answer that stops a manual rewrite.
 const ABORT: &str = "abort";
+/// `claude` option loading extra settings from a file or a JSON string.
+const CLAUDE_SETTINGS: &str = "--settings";
+/// `claude` option disabling every skill and command for the session.
+const CLAUDE_NO_SKILLS: &str = "--disable-slash-commands";
 
 /// Who performs an agent-assisted rewrite.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -125,7 +140,7 @@ impl Runner {
         .and_then(|()| terminal_out.flush())
         .map_err(RewriteError::Terminal)?;
         let status = Command::new(&self.program)
-            .arg(AGENT_PROMPT)
+            .args(self.arguments(staging.path()))
             .current_dir(staging.path())
             .status()
             .map_err(|source| RewriteError::Spawn {
@@ -142,6 +157,38 @@ impl Runner {
             })
         }
     }
+}
+
+impl Runner {
+    /// Arguments of the agent started in the staging directory `staging`:
+    /// the first message, after the options that keep Claude Code from
+    /// loading files of the reference views as instructions.
+    fn arguments(&self, staging: &Path) -> Vec<OsString> {
+        let mut arguments = Vec::new();
+        if self.agent == Agent::Claude {
+            arguments.push(CLAUDE_SETTINGS.into());
+            arguments.push(claude_settings(staging).into());
+            arguments.push(CLAUDE_NO_SKILLS.into());
+        }
+        arguments.push(AGENT_PROMPT.into());
+        arguments
+    }
+}
+
+/// Inline `claude` settings excluding every `CLAUDE.md`, `CLAUDE.local.md`,
+/// and rules file below the staging directory `staging` from memory.
+///
+/// `claudeMdExcludes` globs are matched against absolute paths. The pattern
+/// names the staging directory by its last component, so it holds no part
+/// of the temporary directory path, which could contain glob or JSON
+/// syntax: that component is the fixed staging prefix followed by random
+/// ASCII letters and digits, and stays unique to this rewrite.
+fn claude_settings(staging: &Path) -> String {
+    let name = staging
+        .file_name()
+        .map_or_else(|| staging.as_os_str(), OsStr::as_ref)
+        .to_string_lossy();
+    format!("{{\"claudeMdExcludes\":[\"**/{name}/**\"]}}")
 }
 
 fn manual(
@@ -203,6 +250,27 @@ mod tests {
         let runner = Runner::new(Agent::Claude).with_program("/bin/mock");
         assert_eq!(runner.program, OsString::from("/bin/mock"));
         assert_eq!(runner.agent(), Agent::Claude);
+    }
+
+    #[test]
+    fn pi_gets_the_prompt_only() {
+        let arguments = Runner::new(Agent::Pi).arguments(Path::new("/tmp/skill-curator-rewrite-a"));
+        assert_eq!(arguments, [OsString::from(AGENT_PROMPT)]);
+    }
+
+    #[test]
+    fn claude_excludes_staging_memory_files_and_disables_skills() {
+        let staging = Path::new("/tmp/[x]\"/skill-curator-rewrite-Ab3");
+        let arguments = Runner::new(Agent::Claude).arguments(staging);
+        assert_eq!(
+            arguments,
+            [
+                OsString::from("--settings"),
+                OsString::from("{\"claudeMdExcludes\":[\"**/skill-curator-rewrite-Ab3/**\"]}"),
+                OsString::from("--disable-slash-commands"),
+                OsString::from(AGENT_PROMPT),
+            ]
+        );
     }
 
     #[test]
