@@ -178,8 +178,12 @@ impl Staging {
     /// # Errors
     ///
     /// Returns [`RewriteError::Output`] when `output/` is rejected (see
-    /// [`OutputError`](super::OutputError)).
+    /// [`OutputError`](super::OutputError)), or when the staging directory
+    /// itself was replaced by a symbolic link or another kind of file.
     pub fn collect(&self) -> Result<Proposal, RewriteError> {
+        if !is_real_dir(self.path()) {
+            return Err(output::OutputError::StagingReplaced.into());
+        }
         let (skill, frontmatter_enforced) =
             output::validate(&self.output_dir(), &self.frontmatter)?;
         let empty = SkillTree::default();
@@ -196,22 +200,34 @@ impl Staging {
 impl Drop for Staging {
     fn drop(&mut self) {
         // Removing entries needs write permission on their directory: the
-        // read-only views, and anything the agent made read-only. Only real
-        // directories are touched; symbolic links are never followed.
-        fn make_writable(dir: &Path) {
-            if fs::set_permissions(dir, fs::Permissions::from_mode(WRITABLE_DIR_MODE)).is_err() {
-                return;
-            }
-            let Ok(entries) = fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    make_writable(&entry.path());
-                }
-            }
+        // read-only views, and anything the agent made read-only. A staging
+        // directory replaced by a symbolic link is left alone: `TempDir`
+        // then removes the link only.
+        if is_real_dir(self.dir.path()) {
+            make_writable(self.dir.path());
         }
-        make_writable(self.dir.path());
+    }
+}
+
+/// Whether `path` is a directory itself, not a symbolic link to one.
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+/// Makes the real directory `dir` and every real directory below it
+/// writable. Entries are inspected without following symbolic links, so
+/// nothing outside `dir` is touched; `dir` itself must not be a link.
+fn make_writable(dir: &Path) {
+    if fs::set_permissions(dir, fs::Permissions::from_mode(WRITABLE_DIR_MODE)).is_err() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            make_writable(&entry.path());
+        }
     }
 }
 
@@ -357,5 +373,45 @@ mod tests {
         drop(staging);
         assert_eq!(mode(&locked), 0o500);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_staging_directory_replaced_by_a_link_is_neither_followed_nor_read() {
+        let outside = tempfile::TempDir::new().unwrap();
+        let locked = outside.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::create_dir(locked.join("output")).unwrap();
+        fs::write(
+            locked.join("output/SKILL.md"),
+            "---\nname: grill\n---\nBody\n",
+        )
+        .unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        let staging = Staging::create(job(
+            Inputs::Adaptation {
+                base: None,
+                upstream: tree(&[("SKILL.md", "---\nname: grill\n---\nBody\n")]),
+            },
+            None,
+        ))
+        .unwrap();
+        let root = staging.path().to_path_buf();
+        let moved = outside.path().join("moved");
+        fs::rename(&root, &moved).unwrap();
+        std::os::unix::fs::symlink(&locked, &root).unwrap();
+
+        let err = staging.collect().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RewriteError::Output(output::OutputError::StagingReplaced)
+            ),
+            "{err}"
+        );
+        drop(staging);
+        assert_eq!(mode(&locked), 0o500);
+        assert!(fs::symlink_metadata(&root).is_err(), "the link is removed");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        make_writable(&moved);
     }
 }

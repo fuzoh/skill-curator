@@ -33,6 +33,9 @@ pub enum OutputError {
     },
     /// `output/` itself is a symbolic link or not a directory.
     NotADirectory,
+    /// The staging directory itself was replaced by a symbolic link or
+    /// another kind of file, so `output/` may lie outside it.
+    StagingReplaced,
     /// An entry is a symbolic link.
     Symlink {
         /// Path relative to `output/`.
@@ -83,6 +86,9 @@ impl fmt::Display for OutputError {
             Self::NotADirectory => write!(
                 f,
                 "`{OUTPUT_DIR}/` must be a directory, not a symbolic link or another kind of file"
+            ),
+            Self::StagingReplaced => f.write_str(
+                "the staging directory was replaced by a symbolic link or another kind of file",
             ),
             Self::Symlink { path } => write!(
                 f,

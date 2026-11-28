@@ -373,7 +373,9 @@ Choices made there:
   an Adaptation, one per changed Composition input; written only when there
   are changes), `current/`, and `output/`. Every view and `BRIEF.md` is
   read-only (`0444`, `0555` for executables and directories); removal makes
-  directories writable again without following symbolic links.
+  directories writable again without following symbolic links. A staging
+  directory replaced by a symbolic link is neither made writable nor read:
+  removal deletes the link only, and validation rejects the proposal.
 - `output/` starts as `accepted_local`, else `det(R_new)` for an
   Adaptation, else empty (a first Composition).
 - `BRIEF.md` gives the written intent verbatim, the extra guidance, the
