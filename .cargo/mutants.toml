@@ -30,6 +30,9 @@ examine_globs = [
     # file selection.
     "src/adaptation.rs",
     "src/adaptation/files.rs",
+    # Overwrite protection of manual edits in `skills/` and the staged swap
+    # of Skill directories.
+    "src/materialize.rs",
     # Update conflict handling.
     "src/conflict.rs",
     "src/conflict/**/*.rs",

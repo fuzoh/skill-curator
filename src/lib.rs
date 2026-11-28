@@ -9,6 +9,7 @@ pub mod cli;
 pub mod collection;
 mod error;
 pub mod hash;
+pub mod materialize;
 pub mod safety;
 pub mod source;
 
