@@ -402,6 +402,11 @@ Choices made there:
   whether that changed the agent's `SKILL.md`. D2 is not applied again.
 - The review diff runs from `accepted_local` (or nothing) to the proposal:
   a unified diff per text file, one line per binary file or executable-bit
-  change, with a per-file time limit on line matching so hostile input
-  cannot stall the review. Persisting an accepted proposal is `update`'s
-  job.
+  change. Control characters other than tab and newline (escape sequences,
+  carriage returns, backspaces) are shown as `\u{..}` escapes with a note
+  on the file, so no line of agent or upstream content can hide another
+  one on a terminal. Line matching has a per-file time limit so hostile
+  input cannot stall the review; past the limit the hunks found depend on
+  the machine's speed. That variation is accepted because a diff is only
+  shown and written to staging directories, never hashed or recorded.
+  Persisting an accepted proposal is `update`'s job.
