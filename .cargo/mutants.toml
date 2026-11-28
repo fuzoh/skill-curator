@@ -33,6 +33,12 @@ examine_globs = [
     # Overwrite protection of manual edits in `skills/` and the staged swap
     # of Skill directories.
     "src/materialize.rs",
+    # Install: ownership of Destination targets (unmanaged files are never
+    # touched, manual edits block overwrite and deletion unless forced),
+    # confinement of writes and removals inside Destination roots without
+    # following symbolic links, and validation of the ownership state.
+    "src/install.rs",
+    "src/install/state.rs",
     # Update conflict handling.
     "src/conflict.rs",
     "src/conflict/**/*.rs",
