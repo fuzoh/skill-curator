@@ -12,6 +12,8 @@ use std::io::{self, BufRead, Cursor, Read, Write};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::thread;
+use std::time::Duration;
 
 use skill_curator::adaptation::{SkillFile, SkillTree};
 use skill_curator::collection::manifest::FrontmatterRules;
@@ -382,15 +384,41 @@ impl Mock {
     }
 }
 
+/// Attempts at starting a mock agent that is busy (see [`is_busy`]).
+const BUSY_ATTEMPTS: u32 = 100;
+/// Pause before starting a busy mock agent again.
+const BUSY_PAUSE: Duration = Duration::from_millis(10);
+
+/// Whether `result` failed only because the mock agent was busy. Tests run
+/// in parallel threads, and a process started by one thread briefly
+/// inherits every open file of the test process, including a script that
+/// another thread is still writing; until that process starts its own
+/// program, the script cannot be run ("Text file busy"). Nothing was run,
+/// so the rewrite can be attempted again.
+fn is_busy<T>(result: &Result<T, RewriteError>) -> bool {
+    matches!(
+        result,
+        Err(RewriteError::Spawn { source, .. })
+            if source.kind() == io::ErrorKind::ExecutableFileBusy
+    )
+}
+
 fn run_script(agent: Agent, script: &Path, job: Job) -> Result<Proposal, RewriteError> {
     let runner = Runner::new(agent).with_program(script);
-    let mut terminal_out = Vec::new();
-    rewrite(
-        job,
-        &runner,
-        &mut Cursor::new(Vec::new()),
-        &mut terminal_out,
-    )
+    let mut attempt = 1;
+    loop {
+        let result = rewrite(
+            job.clone(),
+            &runner,
+            &mut Cursor::new(Vec::new()),
+            &mut Vec::new(),
+        );
+        if !is_busy(&result) || attempt == BUSY_ATTEMPTS {
+            return result;
+        }
+        attempt += 1;
+        thread::sleep(BUSY_PAUSE);
+    }
 }
 
 #[test]
@@ -776,13 +804,6 @@ fn run_manual(
     edits: Vec<UserEdit>,
     runner: &Runner,
 ) -> (Result<Proposal, RewriteError>, String) {
-    let printed = Rc::new(RefCell::new(Vec::new()));
-    let mut user = ManualUser {
-        printed: Rc::clone(&printed),
-        answers: Cursor::new(answers.as_bytes().to_vec()),
-        edits: edits.into(),
-        edited_at: None,
-    };
     let job = match adaptation_job(true) {
         Ok(job) => job,
         Err(err) => {
@@ -792,9 +813,31 @@ fn run_manual(
             );
         }
     };
-    let result = rewrite(job, runner, &mut user, &mut Printed(Rc::clone(&printed)));
-    let text = String::from_utf8_lossy(&printed.borrow()).into_owned();
-    (result, text)
+    let mut edits = VecDeque::from(edits);
+    let mut attempt = 1;
+    loop {
+        let printed = Rc::new(RefCell::new(Vec::new()));
+        let mut user = ManualUser {
+            printed: Rc::clone(&printed),
+            answers: Cursor::new(answers.as_bytes().to_vec()),
+            edits,
+            edited_at: None,
+        };
+        let result = rewrite(
+            job.clone(),
+            runner,
+            &mut user,
+            &mut Printed(Rc::clone(&printed)),
+        );
+        if !is_busy(&result) || attempt == BUSY_ATTEMPTS {
+            let text = String::from_utf8_lossy(&printed.borrow()).into_owned();
+            return (result, text);
+        }
+        // A busy agent was not started, so the user made no edit yet.
+        edits = user.edits;
+        attempt += 1;
+        thread::sleep(BUSY_PAUSE);
+    }
 }
 
 #[test]
