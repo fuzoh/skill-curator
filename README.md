@@ -3,9 +3,8 @@
 A configurable tool for downloading, adapting, and maintaining AI coding-agent
 skills on the user's machine.
 
-**Status: early development.** The Rust command-line skeleton exists; its
-commands (`status`, `check`, `update`, `materialize`, `install`) are not
-implemented yet.
+**Status: early development.** `materialize` and `install` are implemented;
+`status`, `check`, and `update` are not implemented yet.
 
 ## Building
 
